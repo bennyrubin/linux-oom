@@ -151,6 +151,9 @@ struct scan_control {
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
+	/* Never shrink slab/inode/dentry caches during this reclaim pass */
+	unsigned int no_slab_reclaim:1;
+
 	/* Allocation order */
 	s8 order;
 
@@ -6040,8 +6043,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 		shrink_lruvec(lruvec, sc);
 
-		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
-			    sc->priority);
+		if (!sc->no_slab_reclaim)
+			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+				    sc->priority);
 
 		/* Record the group's reclaim efficiency */
 		if (!sc->proactive)
@@ -6610,6 +6614,7 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.may_writepage = !laptop_mode,
 		.may_unmap = 1,
 		.may_swap = 1,
+		.no_slab_reclaim = 1,
 	};
 
 	/*
@@ -6986,6 +6991,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 		.gfp_mask = GFP_KERNEL,
 		.order = order,
 		.may_unmap = 1,
+		.no_slab_reclaim = 1,
 	};
 
 	set_task_reclaim_state(current, &sc.reclaim_state);
@@ -7630,6 +7636,7 @@ static int __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned in
 		.may_unmap = !!(node_reclaim_mode & RECLAIM_UNMAP),
 		.may_swap = 1,
 		.reclaim_idx = gfp_zone(gfp_mask),
+		.no_slab_reclaim = 1,
 	};
 	unsigned long pflags;
 
