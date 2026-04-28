@@ -1067,10 +1067,16 @@ static inline struct folio *folio_prealloc(struct mm_struct *src_mm,
 	else
 		new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, addr);
 
-	if (!new_folio)
+	if (!new_folio) {
+		oom_alloc_trace_lc("event=folio_alloc_fail pid=%d tgid=%d addr=%lx zero=%d\n",
+				   current->pid, current->tgid, addr, need_zero);
 		return NULL;
+	}
 
 	if (mem_cgroup_charge(new_folio, src_mm, GFP_KERNEL)) {
+		oom_alloc_trace_lc("event=memcg_charge_fail pid=%d tgid=%d addr=%lx order=%u\n",
+				   current->pid, current->tgid, addr,
+				   folio_order(new_folio));
 		folio_put(new_folio);
 		return NULL;
 	}
@@ -1727,7 +1733,7 @@ retry:
 	do {
 		bool any_skipped = false;
 
-		if (need_resched()) {
+		if (!tlb->oom_teardown_expedited && need_resched()) {
 			direct_reclaim = false;
 			break;
 		}
@@ -1774,7 +1780,8 @@ retry:
 		tlb_flush_mmu(tlb);
 
 	if (addr != end) {
-		cond_resched();
+		if (!tlb->oom_teardown_expedited)
+			cond_resched();
 		force_flush = false;
 		force_break = false;
 		goto retry;
@@ -1827,7 +1834,9 @@ static inline unsigned long zap_pmd_range(struct mmu_gather *tlb,
 		addr = zap_pte_range(tlb, vma, pmd, addr, next, details);
 		if (addr != next)
 			pmd--;
-	} while (pmd++, cond_resched(), addr != end);
+	} while (pmd++,
+		 (!tlb->oom_teardown_expedited && cond_resched()),
+		 addr != end);
 
 	return addr;
 }
@@ -1855,7 +1864,8 @@ static inline unsigned long zap_pud_range(struct mmu_gather *tlb,
 			continue;
 		next = zap_pmd_range(tlb, vma, pud, addr, next, details);
 next:
-		cond_resched();
+		if (!tlb->oom_teardown_expedited)
+			cond_resched();
 	} while (pud++, addr = next, addr != end);
 
 	return addr;
@@ -5071,8 +5081,11 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	folio = alloc_anon_folio(vmf);
 	if (IS_ERR(folio))
 		return 0;
-	if (!folio)
+	if (!folio) {
+		oom_alloc_trace_lc("event=anon_fault_oom pid=%d tgid=%d addr=%lx\n",
+				   current->pid, current->tgid, vmf->address);
 		goto oom;
+	}
 
 	nr_pages = folio_nr_pages(folio);
 	addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
@@ -5131,6 +5144,9 @@ release:
 	folio_put(folio);
 	goto unlock;
 oom:
+	oom_alloc_trace_lc("event=anon_fault_exit pid=%d tgid=%d addr=%lx ret=%x reason=oom\n",
+			   current->pid, current->tgid, vmf->address,
+			   VM_FAULT_OOM);
 	return VM_FAULT_OOM;
 }
 

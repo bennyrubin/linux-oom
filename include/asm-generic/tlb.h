@@ -334,6 +334,12 @@ struct mmu_gather {
 	unsigned int		fullmm : 1;
 
 	/*
+	 * This full-mm tear-down belongs to an OOM victim whose memory should
+	 * be released without voluntary scheduler yield points.
+	 */
+	unsigned int		oom_teardown_expedited : 1;
+
+	/*
 	 * we have performed an operation which
 	 * requires a complete flush of the tlb
 	 */

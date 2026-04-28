@@ -47,7 +47,9 @@ struct oom_control {
 	/* Used by oom implementation, do not set */
 	unsigned long totalpages;
 	struct task_struct *chosen;
+	struct task_struct *boosted;
 	long chosen_points;
+	bool defer_victim_boost;
 
 	/* Used to print the constraint info. */
 	enum oom_constraint constraint;
@@ -55,6 +57,7 @@ struct oom_control {
 
 extern struct mutex oom_lock;
 extern struct mutex oom_adj_mutex;
+extern void oom_boost_deferred_victim(struct oom_control *oc);
 
 static inline void set_current_oom_origin(void)
 {

@@ -277,6 +277,7 @@ int user_min_free_kbytes = -1;
 static int watermark_boost_factor __read_mostly = 15000;
 static int watermark_scale_factor = 10;
 int defrag_mode;
+int sysctl_oom_alloc_trace_printk __read_mostly;
 
 /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
 int movable_zone;
@@ -3773,10 +3774,13 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		.memcg = NULL,
 		.gfp_mask = gfp_mask,
 		.order = order,
+		.defer_victim_boost = true,
 	};
 	struct page *page;
 
 	*did_some_progress = 0;
+	oom_alloc_trace_lc("event=may_oom_enter pid=%d tgid=%d order=%u gfp=%x\n",
+			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
 
 	/*
 	 * Acquire the oom lock.  If that fails, somebody else is
@@ -3784,9 +3788,17 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 */
 	if (!mutex_trylock(&oom_lock)) {
 		*did_some_progress = 1;
+		oom_alloc_trace_lc("event=oom_lock_sleep_enter pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
 		schedule_timeout_uninterruptible(1);
+		oom_alloc_trace_lc("event=oom_lock_sleep_exit pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
 		return NULL;
 	}
+	oom_alloc_trace_lc("event=oom_lock_acquired pid=%d tgid=%d order=%u gfp=%x\n",
+			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
 
 	/*
 	 * Go through the zonelist yet one more time, keep very high watermark
@@ -3798,8 +3810,12 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	page = get_page_from_freelist((gfp_mask | __GFP_HARDWALL) &
 				      ~__GFP_DIRECT_RECLAIM, order,
 				      ALLOC_WMARK_HIGH|ALLOC_CPUSET, ac);
-	if (page)
+	if (page) {
+		oom_alloc_trace_lc("event=may_oom_freelist_success pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
 		goto out;
+	}
 
 	/* Coredumps can quickly deplete all memory reserves */
 	if (current->flags & PF_DUMPCORE)
@@ -3833,9 +3849,14 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 */
 
 	/* Exhausted what can be done so it's blame time */
+	oom_alloc_trace_lc("event=oom_call_start pid=%d tgid=%d order=%u gfp=%x\n",
+			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
 	if (out_of_memory(&oc) ||
 	    WARN_ON_ONCE_GFP(gfp_mask & __GFP_NOFAIL, gfp_mask)) {
 		*did_some_progress = 1;
+		oom_alloc_trace_lc("event=oom_call_progress pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
 
 		/*
 		 * Help non-failing allocations by giving them access to memory
@@ -3845,8 +3866,17 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 			page = __alloc_pages_cpuset_fallback(gfp_mask, order,
 					ALLOC_NO_WATERMARKS, ac);
 	}
+	oom_alloc_trace_lc("event=oom_call_done pid=%d tgid=%d order=%u gfp=%x page=%d progress=%lu\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)gfp_mask, page != NULL,
+			   *did_some_progress);
 out:
 	mutex_unlock(&oom_lock);
+	oom_boost_deferred_victim(&oc);
+	oom_alloc_trace_lc("event=may_oom_done pid=%d tgid=%d order=%u gfp=%x page=%d progress=%lu\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)gfp_mask, page != NULL,
+			   *did_some_progress);
 	return page;
 }
 
@@ -4422,6 +4452,9 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	unsigned int zonelist_iter_cookie;
 	int reserve_flags;
 
+	oom_alloc_trace_lc("event=slowpath_enter pid=%d tgid=%d order=%u gfp=%x\n",
+			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
+
 	if (unlikely(nofail)) {
 		/*
 		 * We most definitely don't want callers attempting to
@@ -4577,8 +4610,12 @@ retry:
 
 	/* Attempt with potentially adjusted zonelist and alloc_flags */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-	if (page)
+	if (page) {
+		oom_alloc_trace_lc("event=slowpath_freelist_success pid=%d tgid=%d order=%u gfp=%x flags=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask, alloc_flags);
 		goto got_pg;
+	}
 
 	/* Caller is not willing to reclaim, we can't balance anything */
 	if (!can_direct_reclaim)
@@ -4633,9 +4670,17 @@ retry:
 		goto restart;
 
 	/* Reclaim has failed us, start killing things */
+	oom_alloc_trace_lc("event=slowpath_before_oom pid=%d tgid=%d order=%u gfp=%x loops=%d progress=%lu\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)gfp_mask, no_progress_loops,
+			   did_some_progress);
 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
-	if (page)
+	if (page) {
+		oom_alloc_trace_lc("event=slowpath_oom_success pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
 		goto got_pg;
+	}
 
 	/* Avoid allocations with no watermarks from looping endlessly */
 	if (tsk_is_oom_victim(current) &&
@@ -4646,6 +4691,10 @@ retry:
 	/* Retry as long as the OOM killer is making progress */
 	if (did_some_progress) {
 		no_progress_loops = 0;
+		oom_alloc_trace_lc("event=slowpath_oom_retry pid=%d tgid=%d order=%u gfp=%x progress=%lu\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask,
+				   did_some_progress);
 		goto retry;
 	}
 
@@ -4689,6 +4738,10 @@ fail:
 	warn_alloc(gfp_mask, ac->nodemask,
 			"page allocation failure: order:%u", order);
 got_pg:
+	oom_alloc_trace_lc("event=slowpath_done pid=%d tgid=%d order=%u gfp=%x page=%d progress=%lu\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)gfp_mask, page != NULL,
+			   did_some_progress);
 	return page;
 }
 
@@ -4949,6 +5002,9 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
 	if (likely(page))
 		goto out;
+	oom_alloc_trace_lc("event=alloc_fast_fail pid=%d tgid=%d order=%u gfp=%x flags=%x\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)alloc_gfp, alloc_flags);
 
 	alloc_gfp = gfp;
 	ac.spread_dirty_pages = false;
@@ -6426,6 +6482,15 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 		.procname	= "defrag_mode",
 		.data		= &defrag_mode,
 		.maxlen		= sizeof(defrag_mode),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "oom_alloc_trace_printk",
+		.data		= &sysctl_oom_alloc_trace_printk,
+		.maxlen		= sizeof(sysctl_oom_alloc_trace_printk),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,

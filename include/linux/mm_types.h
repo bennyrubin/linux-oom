@@ -1107,6 +1107,13 @@ struct mm_struct {
 
 		unsigned long flags; /* Must use atomic bitops to access */
 
+		/*
+		 * Set after this mm is selected by the OOM killer. The final
+		 * mm teardown may run in a different thread than the selected
+		 * victim, so keep the expedited teardown state on the mm.
+		 */
+		bool oom_teardown_expedited;
+
 #ifdef CONFIG_AIO
 		spinlock_t			ioctx_lock;
 		struct kioctx_table __rcu	*ioctx_table;

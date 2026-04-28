@@ -26,6 +26,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/rt.h>
 #include <linux/swap.h>
 #include <linux/syscalls.h>
 #include <linux/timex.h>
@@ -767,6 +768,12 @@ static void mark_oom_victim(struct task_struct *tsk)
 	if (test_and_set_tsk_thread_flag(tsk, TIF_MEMDIE))
 		return;
 
+	WRITE_ONCE(mm->oom_teardown_expedited, true);
+	oom_alloc_trace_if(true,
+			   "event=victim_mark pid=%d tgid=%d victim_pid=%d victim_tgid=%d comm=%s\n",
+			   current->pid, current->tgid, tsk->pid, tsk->tgid,
+			   tsk->comm);
+
 	/* oom_mm is bound to the signal struct life time. */
 	if (!cmpxchg(&tsk->signal->oom_mm, NULL, mm))
 		mmgrab(tsk->signal->oom_mm);
@@ -782,6 +789,45 @@ static void mark_oom_victim(struct task_struct *tsk)
 	cred = get_task_cred(tsk);
 	trace_mark_victim(tsk, cred->uid.val);
 	put_cred(cred);
+}
+
+static void boost_oom_victim(struct task_struct *tsk)
+{
+	struct sched_param sp = {
+		.sched_priority = MAX_RT_PRIO - 1,
+	};
+
+	if (rt_task(tsk) && tsk->rt_priority >= sp.sched_priority)
+		return;
+
+	if (WARN_ON_ONCE(sched_setscheduler_nocheck(tsk, SCHED_FIFO, &sp)))
+		return;
+
+	kick_process(tsk);
+}
+
+static void defer_or_boost_oom_victim(struct oom_control *oc,
+				      struct task_struct *tsk)
+{
+	if (oc && oc->defer_victim_boost) {
+		if (!oc->boosted) {
+			get_task_struct(tsk);
+			oc->boosted = tsk;
+		}
+		return;
+	}
+
+	boost_oom_victim(tsk);
+}
+
+void oom_boost_deferred_victim(struct oom_control *oc)
+{
+	if (!oc->boosted)
+		return;
+
+	boost_oom_victim(oc->boosted);
+	put_task_struct(oc->boosted);
+	oc->boosted = NULL;
 }
 
 /**
@@ -918,7 +964,8 @@ static bool task_will_free_mem(struct task_struct *task)
 	return ret;
 }
 
-static void __oom_kill_process(struct task_struct *victim, const char *message)
+static void __oom_kill_process(struct oom_control *oc, struct task_struct *victim,
+			       const char *message)
 {
 	struct task_struct *p;
 	struct mm_struct *mm;
@@ -959,6 +1006,7 @@ static void __oom_kill_process(struct task_struct *victim, const char *message)
 		from_kuid(&init_user_ns, task_uid(victim)),
 		mm_pgtables_bytes(mm) >> 10, victim->signal->oom_score_adj);
 	task_unlock(victim);
+	defer_or_boost_oom_victim(oc, victim);
 
 	/*
 	 * Kill all user processes sharing victim->mm in other thread groups, if
@@ -1009,7 +1057,7 @@ static int oom_kill_memcg_member(struct task_struct *task, void *message)
 	if (task->signal->oom_score_adj != OOM_SCORE_ADJ_MIN &&
 	    !is_global_init(task)) {
 		get_task_struct(task);
-		__oom_kill_process(task, message);
+		__oom_kill_process(NULL, task, message);
 	}
 	return 0;
 }
@@ -1031,6 +1079,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 		mark_oom_victim(victim);
 		queue_oom_reaper(victim);
 		task_unlock(victim);
+		defer_or_boost_oom_victim(oc, victim);
 		put_task_struct(victim);
 		return;
 	}
@@ -1048,7 +1097,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	 */
 	oom_group = mem_cgroup_get_oom_group(victim, oc->memcg);
 
-	__oom_kill_process(victim, message);
+	__oom_kill_process(oc, victim, message);
 
 	/*
 	 * If necessary, kill all tasks in the selected memory cgroup.
@@ -1131,6 +1180,7 @@ bool out_of_memory(struct oom_control *oc)
 	if (task_will_free_mem(current)) {
 		mark_oom_victim(current);
 		queue_oom_reaper(current);
+		defer_or_boost_oom_victim(oc, current);
 		return true;
 	}
 
