@@ -15,7 +15,13 @@ SYM_PIC_ALIAS(physical_mask);
 
 pgtable_t pte_alloc_one(struct mm_struct *mm)
 {
-	return __pte_alloc_one(mm, GFP_PGTABLE_USER);
+	/*
+	 * PTE pages are required before a userspace fault can install data
+	 * pages. Let this order-0 allocation dip into the min reserve so a
+	 * latency-critical fault is less likely to spin through OOM retries
+	 * waiting for a single page-table page.
+	 */
+	return __pte_alloc_one(mm, GFP_PGTABLE_USER | __GFP_HIGH);
 }
 
 void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
