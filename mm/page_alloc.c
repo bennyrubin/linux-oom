@@ -3774,6 +3774,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		.memcg = NULL,
 		.gfp_mask = gfp_mask,
 		.order = order,
+		.defer_victim_boost = true,
 	};
 	struct page *page;
 
@@ -3871,6 +3872,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 			   *did_some_progress);
 out:
 	mutex_unlock(&oom_lock);
+	oom_boost_deferred_victim(&oc);
 	oom_alloc_trace_lc("event=may_oom_done pid=%d tgid=%d order=%u gfp=%x page=%d progress=%lu\n",
 			   current->pid, current->tgid, order,
 			   (__force unsigned int)gfp_mask, page != NULL,

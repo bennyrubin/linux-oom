@@ -1266,6 +1266,14 @@ void exit_mmap(struct mm_struct *mm)
 	int count = 0;
 
 	oom_teardown_expedited = READ_ONCE(mm->oom_teardown_expedited);
+	if (oom_teardown_expedited && !rt_task(current)) {
+		struct sched_param sp = {
+			.sched_priority = MAX_RT_PRIO - 1,
+		};
+
+		WARN_ON_ONCE(sched_setscheduler_nocheck(current, SCHED_FIFO, &sp));
+		kick_process(current);
+	}
 	oom_alloc_trace_if(oom_teardown_expedited,
 			   "event=victim_exit_mmap_enter pid=%d tgid=%d mm=%px boosted=%d\n",
 			   current->pid, current->tgid, mm, rt_task(current));

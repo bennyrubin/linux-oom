@@ -149,7 +149,8 @@ static void __tlb_batch_free_encoded_pages(struct mmu_gather *tlb,
 		pages += nr;
 		batch->nr -= nr;
 
-		cond_resched();
+		if (!tlb->oom_teardown_expedited)
+			cond_resched();
 	}
 }
 
