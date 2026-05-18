@@ -176,7 +176,7 @@ static bool oom_unkillable_task(struct task_struct *p)
  * dump_unreclaimable_slab() could help in the case that
  * oom due to too much unreclaimable slab used by kernel.
 */
-static bool should_dump_unreclaim_slab(void)
+static bool __maybe_unused should_dump_unreclaim_slab(void)
 {
 	unsigned long nr_lru;
 
@@ -380,7 +380,7 @@ static void select_bad_process(struct oom_control *oc)
 	}
 }
 
-static int dump_task(struct task_struct *p, void *arg)
+static int __maybe_unused dump_task(struct task_struct *p, void *arg)
 {
 	struct oom_control *oc = arg;
 	struct task_struct *task;
@@ -423,7 +423,7 @@ static int dump_task(struct task_struct *p, void *arg)
  * State information includes task's pid, uid, tgid, vm size, rss,
  * pgtables_bytes, swapents, oom_score_adj value, and name.
  */
-static void dump_tasks(struct oom_control *oc)
+static void __maybe_unused dump_tasks(struct oom_control *oc)
 {
 	pr_info("Tasks state (memory values in pages):\n");
 	pr_info("[  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name\n");
@@ -447,34 +447,10 @@ static void dump_tasks(struct oom_control *oc)
 
 static void dump_oom_victim(struct oom_control *oc, struct task_struct *victim)
 {
-	/* one line summary of the oom killer context. */
-	pr_info("oom-kill:constraint=%s,nodemask=%*pbl",
-			oom_constraint_text[oc->constraint],
-			nodemask_pr_args(oc->nodemask));
-	cpuset_print_current_mems_allowed();
-	mem_cgroup_print_oom_context(oc->memcg, victim);
-	pr_cont(",task=%s,pid=%d,uid=%d\n", victim->comm, victim->pid,
-		from_kuid(&init_user_ns, task_uid(victim)));
 }
 
 static void dump_header(struct oom_control *oc)
 {
-	pr_warn("%s invoked oom-killer: gfp_mask=%#x(%pGg), order=%d, oom_score_adj=%hd\n",
-		current->comm, oc->gfp_mask, &oc->gfp_mask, oc->order,
-			current->signal->oom_score_adj);
-	if (!IS_ENABLED(CONFIG_COMPACTION) && oc->order)
-		pr_warn("COMPACTION is disabled!!!\n");
-
-	dump_stack();
-	if (is_memcg_oom(oc))
-		mem_cgroup_print_oom_meminfo(oc->memcg);
-	else {
-		__show_mem(SHOW_MEM_FILTER_NODES, oc->nodemask, gfp_zone(oc->gfp_mask));
-		if (should_dump_unreclaim_slab())
-			dump_unreclaimable_slab();
-	}
-	if (sysctl_oom_dump_tasks)
-		dump_tasks(oc);
 }
 
 /*
@@ -596,11 +572,6 @@ static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 	if (!ret)
 		goto out_finish;
 
-	pr_info("oom_reaper: reaped process %d (%s), now anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
-			task_pid_nr(tsk), tsk->comm,
-			K(get_mm_counter(mm, MM_ANONPAGES)),
-			K(get_mm_counter(mm, MM_FILEPAGES)),
-			K(get_mm_counter(mm, MM_SHMEMPAGES)));
 out_finish:
 	trace_finish_task_reaping(tsk->pid);
 out_unlock:
@@ -622,11 +593,6 @@ static void oom_reap_task(struct task_struct *tsk)
 	if (attempts <= MAX_OOM_REAP_RETRIES ||
 	    test_bit(MMF_OOM_SKIP, &mm->flags))
 		goto done;
-
-	pr_info("oom_reaper: unable to reap pid:%d (%s)\n",
-		task_pid_nr(tsk), tsk->comm);
-	sched_show_task(tsk);
-	debug_show_all_locks();
 
 done:
 	tsk->oom_reaper_list = NULL;
@@ -973,8 +939,6 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 
 	p = find_lock_task_mm(victim);
 	if (!p) {
-		pr_info("%s: OOM victim %d (%s) is already exiting. Skip killing the task\n",
-			message, task_pid_nr(victim), victim->comm);
 		put_task_struct(victim);
 		return;
 	} else if (victim != p) {
@@ -998,13 +962,6 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	 */
 	do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID);
 	mark_oom_victim(victim);
-	pr_err("%s: Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%hd\n",
-		message, task_pid_nr(victim), victim->comm, K(mm->total_vm),
-		K(get_mm_counter(mm, MM_ANONPAGES)),
-		K(get_mm_counter(mm, MM_FILEPAGES)),
-		K(get_mm_counter(mm, MM_SHMEMPAGES)),
-		from_kuid(&init_user_ns, task_uid(victim)),
-		mm_pgtables_bytes(mm) >> 10, victim->signal->oom_score_adj);
 	task_unlock(victim);
 	defer_or_boost_oom_victim(oc, victim);
 
@@ -1026,9 +983,6 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 		if (is_global_init(p)) {
 			can_oom_reap = false;
 			set_bit(MMF_OOM_SKIP, &mm->flags);
-			pr_info("oom killer %d (%s) has mm pinned by %d (%s)\n",
-					task_pid_nr(victim), victim->comm,
-					task_pid_nr(p), p->comm);
 			continue;
 		}
 		/*
@@ -1104,7 +1058,6 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	 */
 	if (oom_group) {
 		memcg_memory_event(oom_group, MEMCG_OOM_GROUP_KILL);
-		mem_cgroup_print_oom_group(oom_group);
 		mem_cgroup_scan_tasks(oom_group, oom_kill_memcg_member,
 				      (void *)message);
 		mem_cgroup_put(oom_group);
@@ -1215,7 +1168,6 @@ bool out_of_memory(struct oom_control *oc)
 	/* Found nothing?!?! */
 	if (!oc->chosen) {
 		dump_header(oc);
-		pr_warn("Out of memory and no killable processes...\n");
 		/*
 		 * If we got here due to an actual allocation at the
 		 * system level, we cannot survive this and will enter
