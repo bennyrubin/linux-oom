@@ -26,6 +26,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/rt.h>
 #include <linux/swap.h>
 #include <linux/syscalls.h>
 #include <linux/timex.h>
@@ -767,6 +768,11 @@ static void mark_oom_victim(struct task_struct *tsk)
 	if (test_and_set_tsk_thread_flag(tsk, TIF_MEMDIE))
 		return;
 
+	oom_alloc_trace_if(true,
+			   "event=victim_mark pid=%d tgid=%d victim_pid=%d victim_tgid=%d comm=%s\n",
+			   current->pid, current->tgid, tsk->pid, tsk->tgid,
+			   tsk->comm);
+
 	/* oom_mm is bound to the signal struct life time. */
 	if (!cmpxchg(&tsk->signal->oom_mm, NULL, mm))
 		mmgrab(tsk->signal->oom_mm);
@@ -918,7 +924,8 @@ static bool task_will_free_mem(struct task_struct *task)
 	return ret;
 }
 
-static void __oom_kill_process(struct task_struct *victim, const char *message)
+static void __oom_kill_process(struct oom_control *oc, struct task_struct *victim,
+			       const char *message)
 {
 	struct task_struct *p;
 	struct mm_struct *mm;
@@ -1009,7 +1016,7 @@ static int oom_kill_memcg_member(struct task_struct *task, void *message)
 	if (task->signal->oom_score_adj != OOM_SCORE_ADJ_MIN &&
 	    !is_global_init(task)) {
 		get_task_struct(task);
-		__oom_kill_process(task, message);
+		__oom_kill_process(NULL, task, message);
 	}
 	return 0;
 }
@@ -1048,7 +1055,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	 */
 	oom_group = mem_cgroup_get_oom_group(victim, oc->memcg);
 
-	__oom_kill_process(victim, message);
+	__oom_kill_process(oc, victim, message);
 
 	/*
 	 * If necessary, kill all tasks in the selected memory cgroup.

@@ -13,6 +13,8 @@
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
 
+#include "internal.h"
+
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
 
 static bool tlb_next_batch(struct mmu_gather *tlb)
@@ -98,7 +100,8 @@ void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma)
  */
 #define MAX_NR_FOLIOS_PER_FREE		512
 
-static void __tlb_batch_free_encoded_pages(struct mmu_gather_batch *batch)
+static void __tlb_batch_free_encoded_pages(struct mmu_gather *tlb,
+					   struct mmu_gather_batch *batch)
 {
 	struct encoded_page **pages = batch->encoded_pages;
 	unsigned int nr, nr_pages;
@@ -133,7 +136,16 @@ static void __tlb_batch_free_encoded_pages(struct mmu_gather_batch *batch)
 			}
 		}
 
+		oom_alloc_trace_if(tlb->oom_teardown_expedited,
+				   "event=victim_free_chunk_enter pid=%d tgid=%d nr=%u remaining=%u batch=%px\n",
+				   current->pid, current->tgid, nr, batch->nr,
+				   batch);
 		free_pages_and_swap_cache(pages, nr);
+		oom_alloc_trace_if(tlb->oom_teardown_expedited,
+				   "event=victim_free_chunk_done pid=%d tgid=%d nr=%u remaining=%u batch=%px\n",
+				   current->pid, current->tgid, nr,
+				   batch->nr > nr ? batch->nr - nr : 0,
+				   batch);
 		pages += nr;
 		batch->nr -= nr;
 
@@ -145,8 +157,16 @@ static void tlb_batch_pages_flush(struct mmu_gather *tlb)
 {
 	struct mmu_gather_batch *batch;
 
-	for (batch = &tlb->local; batch && batch->nr; batch = batch->next)
-		__tlb_batch_free_encoded_pages(batch);
+	for (batch = &tlb->local; batch && batch->nr; batch = batch->next) {
+		oom_alloc_trace_if(tlb->oom_teardown_expedited,
+				   "event=victim_batch_flush_enter pid=%d tgid=%d nr=%u batch=%px\n",
+				   current->pid, current->tgid, batch->nr,
+				   batch);
+		__tlb_batch_free_encoded_pages(tlb, batch);
+		oom_alloc_trace_if(tlb->oom_teardown_expedited,
+				   "event=victim_batch_flush_done pid=%d tgid=%d batch=%px\n",
+				   current->pid, current->tgid, batch);
+	}
 	tlb->active = &tlb->local;
 }
 
@@ -400,8 +420,14 @@ static void tlb_flush_mmu_free(struct mmu_gather *tlb)
 
 void tlb_flush_mmu(struct mmu_gather *tlb)
 {
+	oom_alloc_trace_if(tlb->oom_teardown_expedited,
+			   "event=victim_tlb_flush_mmu_enter pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	tlb_flush_mmu_tlbonly(tlb);
 	tlb_flush_mmu_free(tlb);
+	oom_alloc_trace_if(tlb->oom_teardown_expedited,
+			   "event=victim_tlb_flush_mmu_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 }
 
 static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
@@ -409,6 +435,7 @@ static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
 {
 	tlb->mm = mm;
 	tlb->fullmm = fullmm;
+	tlb->oom_teardown_expedited = false;
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
 	tlb->need_flush_all = 0;

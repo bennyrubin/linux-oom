@@ -46,6 +46,7 @@
 #include <linux/pkeys.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/rt.h>
 #include <linux/ksm.h>
 #include <linux/memfd.h>
 
@@ -1259,9 +1260,15 @@ void exit_mmap(struct mm_struct *mm)
 {
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
+	bool oom_teardown_expedited;
 	unsigned long nr_accounted = 0;
 	VMA_ITERATOR(vmi, mm, 0);
 	int count = 0;
+
+	oom_teardown_expedited = READ_ONCE(mm->oom_teardown_expedited);
+	oom_alloc_trace_if(oom_teardown_expedited,
+			   "event=victim_exit_mmap_enter pid=%d tgid=%d mm=%px boosted=%d\n",
+			   current->pid, current->tgid, mm, rt_task(current));
 
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
@@ -1279,6 +1286,7 @@ void exit_mmap(struct mm_struct *mm)
 
 	flush_cache_mm(mm);
 	tlb_gather_mmu_fullmm(&tlb, mm);
+	tlb.oom_teardown_expedited = oom_teardown_expedited;
 	/* update_hiwater_rss(mm) here? but nobody should be looking */
 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
 	unmap_vmas(&tlb, &vmi.mas, vma, 0, ULONG_MAX, ULONG_MAX, false);
@@ -1295,6 +1303,9 @@ void exit_mmap(struct mm_struct *mm)
 	free_pgtables(&tlb, &vmi.mas, vma, FIRST_USER_ADDRESS,
 		      USER_PGTABLES_CEILING, true);
 	tlb_finish_mmu(&tlb);
+	oom_alloc_trace_if(oom_teardown_expedited,
+			   "event=victim_exit_mmap_freed pid=%d tgid=%d mm=%px\n",
+			   current->pid, current->tgid, mm);
 
 	/*
 	 * Walk the list again, actually closing and freeing it, with preemption

@@ -14,15 +14,48 @@
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
 #include <linux/rmap.h>
+#include <linux/sched.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
+#include <linux/ktime.h>
 #include <linux/tracepoint-defs.h>
 
 /* Internal core VMA manipulation functions. */
 #include "vma.h"
 
 struct folio_batch;
+
+extern int sysctl_oom_alloc_trace_printk;
+
+static inline bool oom_alloc_trace_enabled(void)
+{
+	return READ_ONCE(sysctl_oom_alloc_trace_printk);
+}
+
+static inline bool oom_alloc_trace_current_lc(void)
+{
+	const char *comm = current->comm;
+
+	return oom_alloc_trace_enabled() &&
+		comm[0] == 'l' && comm[1] == 'c' && comm[2] == '_' &&
+		comm[3] == 's' && comm[4] == 'e' && comm[5] == 'r' &&
+		comm[6] == 'v' && comm[7] == 'e' && comm[8] == 'r';
+}
+
+#define oom_alloc_trace_lc(fmt, ...)					\
+	do {								\
+		if (oom_alloc_trace_current_lc())			\
+			trace_printk("oomtrace ts=%llu " fmt,		\
+				     ktime_get_ns(), ##__VA_ARGS__);	\
+	} while (0)
+
+#define oom_alloc_trace_if(cond, fmt, ...)				\
+	do {								\
+		if (oom_alloc_trace_enabled() && (cond))			\
+			trace_printk("oomtrace ts=%llu " fmt,		\
+				     ktime_get_ns(), ##__VA_ARGS__);	\
+	} while (0)
 
 /*
  * Maintains state across a page table move. The operation assumes both source
