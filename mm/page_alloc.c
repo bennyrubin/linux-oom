@@ -4625,6 +4625,21 @@ retry:
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
 
+	/*
+	 * Allow a single direct reclaim pass before falling back to the OOM
+	 * killer. Unlike upstream, we deliberately do NOT re-arm the
+	 * should_reclaim_retry() loop below, so this is exactly one
+	 * try_to_free_pages() invocation: reclaim clean page cache first, and
+	 * only proceed to OOM if that single pass fails to make progress. For
+	 * the order-0 allocations that dominate page-fault pressure,
+	 * should_compact_retry() returns false, so there is no retry path back
+	 * to the 'retry' label and reclaim happens at most once.
+	 */
+	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
+							&did_some_progress);
+	if (page)
+		goto got_pg;
+
 	/* Try direct compaction and then allocating */
 	page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,
 					compact_priority, &compact_result);
