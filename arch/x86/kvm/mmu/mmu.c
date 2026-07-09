@@ -7202,6 +7202,34 @@ restart:
 
 void kvm_arch_flush_shadow_all(struct kvm *kvm)
 {
+	/*
+	 * OOM-teardown deferral prototype (branch ept-zap-defer): skip the
+	 * O(#SPTEs) TDP walk on the exit_mmap critical path.  Just invalidate
+	 * and schedule the direct roots here; the fd-close zap
+	 * (kvm_mmu_uninit_tdp_mmu -> kvm_tdp_mmu_zap_invalidated_roots) already
+	 * performs the walk, and after deferral it does so *after* the guest's
+	 * memory has been freed and in a context that yields freely.
+	 *
+	 * Safe on this kernel because the release-path zap does no TLB flush and
+	 * touches no struct page (A/D writeback moved to fault-in by the ~6.13
+	 * pfn-refcount rework), and EPTP-tagged translations are architecturally
+	 * unreachable once every vCPU thread is dead (mm_users == 0 at .release).
+	 * The invalidate keeps the TDP-MMU reference alive (it is gifted to the
+	 * deferred zap), so roots + SPTEs survive until fd-close.
+	 *
+	 * Gated to plain TDP direct roots with no active shadow-MMU pages: a VM
+	 * that ran nested guests (non-empty active_mmu_pages) or a non-TDP-MMU
+	 * setup falls back to the full synchronous zap, since kvm_mmu_uninit_tdp_mmu
+	 * only cleans TDP roots.  This host is CONFIG_KVM_INTEL without TDX, so
+	 * there are no mirror roots and KVM_DIRECT_ROOTS is the whole set.
+	 */
+	if (tdp_mmu_enabled && list_empty(&kvm->arch.active_mmu_pages)) {
+		write_lock(&kvm->mmu_lock);
+		kvm_tdp_mmu_invalidate_roots(kvm, KVM_DIRECT_ROOTS);
+		write_unlock(&kvm->mmu_lock);
+		return;
+	}
+
 	kvm_mmu_zap_all(kvm);
 }
 
