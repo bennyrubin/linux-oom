@@ -1338,6 +1338,20 @@ destroy:
 	__mt_destroy(&mm->mm_mt);
 	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
+
+	/*
+	 * Guest/anon memory is now freed.  Drop the OOM teardown RT boost so the
+	 * remaining teardown -- notably KVM's deferred EPT walk at fd-close
+	 * (kvm_mmu_uninit_tdp_mmu, see the ept-zap-defer change in
+	 * kvm_arch_flush_shadow_all) -- runs as CFS and can be preempted by
+	 * ksoftirqd (NET_RX), instead of SCHED_FIFO starving softirq on the zap
+	 * CPU.  The boost was meant to expedite reclaim, which is complete here.
+	 */
+	if (oom_teardown_expedited && rt_task(current)) {
+		struct sched_param sp = { .sched_priority = 0 };
+
+		WARN_ON_ONCE(sched_setscheduler_nocheck(current, SCHED_NORMAL, &sp));
+	}
 }
 
 /*
