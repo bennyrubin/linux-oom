@@ -340,6 +340,22 @@ struct mmu_gather {
 	unsigned int		oom_teardown_expedited : 1;
 
 	/*
+	 * Skip the voluntary yield points in the zap/free loops. Set only when
+	 * an expedited teardown runs at the full legacy boost priority
+	 * (vm.oom_teardown_boost_prio == 99); a capped boost keeps yielding so
+	 * higher-priority RT tasks (the LC serving chain) can preempt it under
+	 * PREEMPT_VOLUNTARY. Cleared if the boost decays mid-teardown.
+	 */
+	unsigned int		oom_teardown_noresched : 1;
+
+	/*
+	 * The boost for this expedited teardown was dropped mid-teardown
+	 * because free memory recovered past the watermarks
+	 * (vm.oom_teardown_boost_decay); checked so decay runs only once.
+	 */
+	unsigned int		oom_teardown_decayed : 1;
+
+	/*
 	 * we have performed an operation which
 	 * requires a complete flush of the tlb
 	 */

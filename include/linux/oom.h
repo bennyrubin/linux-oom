@@ -13,6 +13,7 @@ struct zonelist;
 struct notifier_block;
 struct mem_cgroup;
 struct task_struct;
+struct mmu_gather;
 
 enum oom_constraint {
 	CONSTRAINT_NONE,
@@ -58,6 +59,22 @@ struct oom_control {
 extern struct mutex oom_lock;
 extern struct mutex oom_adj_mutex;
 extern void oom_boost_deferred_victim(struct oom_control *oc);
+
+/*
+ * SCHED_FIFO priority for the OOM victim teardown boost (mark_oom_victim /
+ * exit_mmap). 99 = legacy behavior (max priority + no voluntary yields in the
+ * zap/free loops); 1-98 = capped boost that keeps yield points so a
+ * higher-priority RT band (e.g. an LC serving chain) always preempts it;
+ * 0 = no boost at all.
+ */
+extern int sysctl_oom_teardown_boost_prio;
+/*
+ * When 1, an expedited teardown drops its RT boost mid-teardown as soon as
+ * free memory recovers past the zone watermarks plus ~1.5% of RAM headroom —
+ * the boost exists to unblock allocators, not to finish the teardown fast.
+ */
+extern int sysctl_oom_teardown_boost_decay;
+extern void oom_teardown_maybe_decay(struct mmu_gather *tlb);
 
 static inline void set_current_oom_origin(void)
 {

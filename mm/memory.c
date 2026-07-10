@@ -1733,7 +1733,7 @@ retry:
 	do {
 		bool any_skipped = false;
 
-		if (!tlb->oom_teardown_expedited && need_resched()) {
+		if (!tlb->oom_teardown_noresched && need_resched()) {
 			direct_reclaim = false;
 			break;
 		}
@@ -1780,7 +1780,7 @@ retry:
 		tlb_flush_mmu(tlb);
 
 	if (addr != end) {
-		if (!tlb->oom_teardown_expedited)
+		if (!tlb->oom_teardown_noresched)
 			cond_resched();
 		force_flush = false;
 		force_break = false;
@@ -1835,7 +1835,7 @@ static inline unsigned long zap_pmd_range(struct mmu_gather *tlb,
 		if (addr != next)
 			pmd--;
 	} while (pmd++,
-		 (!tlb->oom_teardown_expedited && cond_resched()),
+		 (!tlb->oom_teardown_noresched && cond_resched()),
 		 addr != end);
 
 	return addr;
@@ -1864,7 +1864,7 @@ static inline unsigned long zap_pud_range(struct mmu_gather *tlb,
 			continue;
 		next = zap_pmd_range(tlb, vma, pud, addr, next, details);
 next:
-		if (!tlb->oom_teardown_expedited)
+		if (!tlb->oom_teardown_noresched)
 			cond_resched();
 	} while (pud++, addr = next, addr != end);
 

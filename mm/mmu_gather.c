@@ -9,6 +9,7 @@
 #include <linux/smp.h>
 #include <linux/swap.h>
 #include <linux/rmap.h>
+#include <linux/oom.h>
 
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
@@ -149,7 +150,8 @@ static void __tlb_batch_free_encoded_pages(struct mmu_gather *tlb,
 		pages += nr;
 		batch->nr -= nr;
 
-		if (!tlb->oom_teardown_expedited)
+		oom_teardown_maybe_decay(tlb);
+		if (!tlb->oom_teardown_noresched)
 			cond_resched();
 	}
 }
@@ -437,6 +439,8 @@ static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
 	tlb->mm = mm;
 	tlb->fullmm = fullmm;
 	tlb->oom_teardown_expedited = false;
+	tlb->oom_teardown_noresched = false;
+	tlb->oom_teardown_decayed = false;
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
 	tlb->need_flush_all = 0;

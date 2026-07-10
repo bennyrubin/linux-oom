@@ -43,6 +43,8 @@
 #include <linux/ratelimit.h>
 #include <linux/kthread.h>
 #include <linux/init.h>
+#include <linux/vmstat.h>
+#include <asm/tlb.h>
 #include <linux/mmu_notifier.h>
 #include <linux/cred.h>
 #include <linux/nmi.h>
@@ -672,6 +674,8 @@ static void queue_oom_reaper(struct task_struct *tsk)
 }
 
 #ifdef CONFIG_SYSCTL
+static const int oom_teardown_boost_prio_max = MAX_RT_PRIO - 1;
+
 static const struct ctl_table vm_oom_kill_table[] = {
 	{
 		.procname	= "panic_on_oom",
@@ -695,6 +699,24 @@ static const struct ctl_table vm_oom_kill_table[] = {
 		.maxlen		= sizeof(sysctl_oom_dump_tasks),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "oom_teardown_boost_prio",
+		.data		= &sysctl_oom_teardown_boost_prio,
+		.maxlen		= sizeof(sysctl_oom_teardown_boost_prio),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= (void *)&oom_teardown_boost_prio_max,
+	},
+	{
+		.procname	= "oom_teardown_boost_decay",
+		.data		= &sysctl_oom_teardown_boost_decay,
+		.maxlen		= sizeof(sysctl_oom_teardown_boost_decay),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 };
 #endif
@@ -757,11 +779,34 @@ static void mark_oom_victim(struct task_struct *tsk)
 	put_cred(cred);
 }
 
+/*
+ * SCHED_FIFO priority for the OOM teardown boost. 99 keeps the legacy
+ * behavior (max priority, no voluntary yields in the zap/free loops). A
+ * capped value (1-98) lets an RT band above it -- e.g. a latency-critical
+ * serving chain (threaded NAPI, vhost, vCPU threads) -- always preempt the
+ * teardown, so victims can be torn down on shared CPUs without pinning.
+ * 0 disables the boost entirely.
+ */
+int sysctl_oom_teardown_boost_prio = MAX_RT_PRIO - 1;
+
+/*
+ * When 1, the boosted teardown demotes itself back to SCHED_NORMAL as soon
+ * as free memory has recovered past the watermarks plus ~1.5% of RAM
+ * (checked at every gather-batch free). The boost exists to unblock stalled
+ * allocators, not to finish the teardown quickly -- once nobody can be
+ * waiting on memory, finishing at normal priority is strictly better for
+ * whatever else shares the CPU. Default 0 = legacy latched boost.
+ */
+int sysctl_oom_teardown_boost_decay;
+
 static void boost_oom_victim(struct task_struct *tsk)
 {
 	struct sched_param sp = {
-		.sched_priority = MAX_RT_PRIO - 1,
+		.sched_priority = READ_ONCE(sysctl_oom_teardown_boost_prio),
 	};
+
+	if (!sp.sched_priority)
+		return;
 
 	if (rt_task(tsk) && tsk->rt_priority >= sp.sched_priority)
 		return;
@@ -770,6 +815,43 @@ static void boost_oom_victim(struct task_struct *tsk)
 		return;
 
 	kick_process(tsk);
+}
+
+/*
+ * Decay the OOM teardown boost once memory pressure is over: free pages
+ * comfortably above every zone's high watermark (totalreserve_pages) plus
+ * ~1.5% of RAM headroom means no allocator can still be blocked waiting for
+ * this teardown, so keeping the victim at RT priority only risks starving
+ * innocent CFS/idle work sharing its CPU. Called from the gather-batch free
+ * loop -- the teardown's own progress is what makes the condition true, and
+ * checking here (instead of an external poller) bounds the overhang to one
+ * batch. Clears oom_teardown_noresched so the remaining teardown also
+ * resumes voluntary yielding.
+ */
+void oom_teardown_maybe_decay(struct mmu_gather *tlb)
+{
+	struct sched_param sp = { .sched_priority = 0 };
+
+	if (!tlb->oom_teardown_expedited || tlb->oom_teardown_decayed)
+		return;
+	if (!READ_ONCE(sysctl_oom_teardown_boost_decay))
+		return;
+	if (!rt_task(current)) {
+		tlb->oom_teardown_decayed = 1;
+		tlb->oom_teardown_noresched = 0;
+		return;
+	}
+	if (global_zone_page_state(NR_FREE_PAGES) <=
+	    totalreserve_pages + (totalram_pages() >> 6))
+		return;
+
+	WARN_ON_ONCE(sched_setscheduler_nocheck(current, SCHED_NORMAL, &sp));
+	tlb->oom_teardown_decayed = 1;
+	tlb->oom_teardown_noresched = 0;
+	oom_alloc_trace_if(true,
+			   "event=victim_boost_decay pid=%d tgid=%d free_kb=%lu\n",
+			   current->pid, current->tgid,
+			   global_zone_page_state(NR_FREE_PAGES) << (PAGE_SHIFT - 10));
 }
 
 static void defer_or_boost_oom_victim(struct oom_control *oc,

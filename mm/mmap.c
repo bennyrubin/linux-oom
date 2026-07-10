@@ -1268,11 +1268,14 @@ void exit_mmap(struct mm_struct *mm)
 	oom_teardown_expedited = READ_ONCE(mm->oom_teardown_expedited);
 	if (oom_teardown_expedited && !rt_task(current)) {
 		struct sched_param sp = {
-			.sched_priority = MAX_RT_PRIO - 1,
+			.sched_priority = READ_ONCE(sysctl_oom_teardown_boost_prio),
 		};
 
-		WARN_ON_ONCE(sched_setscheduler_nocheck(current, SCHED_FIFO, &sp));
-		kick_process(current);
+		if (sp.sched_priority) {
+			WARN_ON_ONCE(sched_setscheduler_nocheck(current,
+								SCHED_FIFO, &sp));
+			kick_process(current);
+		}
 	}
 	oom_alloc_trace_if(oom_teardown_expedited,
 			   "event=victim_exit_mmap_enter pid=%d tgid=%d mm=%px boosted=%d\n",
@@ -1295,6 +1298,13 @@ void exit_mmap(struct mm_struct *mm)
 	flush_cache_mm(mm);
 	tlb_gather_mmu_fullmm(&tlb, mm);
 	tlb.oom_teardown_expedited = oom_teardown_expedited;
+	/*
+	 * Only the full legacy boost skips voluntary yields; a capped boost
+	 * (prio < 99) must keep yielding so the RT band above it can preempt
+	 * the teardown under PREEMPT_VOLUNTARY.
+	 */
+	tlb.oom_teardown_noresched = oom_teardown_expedited &&
+		READ_ONCE(sysctl_oom_teardown_boost_prio) == MAX_RT_PRIO - 1;
 	/* update_hiwater_rss(mm) here? but nobody should be looking */
 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
 	unmap_vmas(&tlb, &vmi.mas, vma, 0, ULONG_MAX, ULONG_MAX, false);
