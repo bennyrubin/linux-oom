@@ -2470,7 +2470,9 @@ struct folio *vma_alloc_folio_noprof(gfp_t gfp, int order, struct vm_area_struct
 		gfp |= __GFP_NOWARN;
 
 	if (order == 0 && current->mm == vma->vm_mm &&
-	    !strcmp(current->comm, "lc_server"))
+	    (!strcmp(current->comm, "lc_server") ||
+	     !strcmp(current->comm, "redis-server") ||
+	     !strcmp(current->comm, "memcached")))
 		gfp |= __GFP_HIGH;
 
 	pol = get_vma_policy(vma, addr, order, &ilx);
