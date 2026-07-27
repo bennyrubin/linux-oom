@@ -4440,8 +4440,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
 	bool can_compact = gfp_compaction_allowed(gfp_mask);
 	bool nofail = gfp_mask & __GFP_NOFAIL;
-	bool lc_bypass_reclaim = order == 0 && (gfp_mask & __GFP_HIGH) &&
-				 oom_alloc_current_lc();
+	bool lc_bypass_reclaim = oom_alloc_current_lc();
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -4629,11 +4628,11 @@ retry:
 
 	/*
 	 * Ordinary allocations get one bounded direct-reclaim pass. A
-	 * latency-critical order-0 allocation already marked __GFP_HIGH skips
-	 * that pass: measurements show that hundreds of individually short
-	 * passes can consume most of a request's wall time. Let it use the
-	 * protected reserve or drive OOM progress instead; BE allocations keep
-	 * reclaiming clean cache exactly as before.
+	 * allocation made in a latency-critical task skips that pass:
+	 * measurements show that hundreds of individually short passes can
+	 * consume most of a request's wall time. Let it use its protected
+	 * reserve, fail a retryable high-order allocation, or drive OOM
+	 * progress instead; BE allocations keep reclaiming exactly as before.
 	 */
 	if (!lc_bypass_reclaim) {
 		page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags,
