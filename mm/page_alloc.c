@@ -4440,6 +4440,8 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
 	bool can_compact = gfp_compaction_allowed(gfp_mask);
 	bool nofail = gfp_mask & __GFP_NOFAIL;
+	bool lc_bypass_reclaim = order == 0 && (gfp_mask & __GFP_HIGH) &&
+				 oom_alloc_current_lc();
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -4626,19 +4628,23 @@ retry:
 		goto nopage;
 
 	/*
-	 * Allow a single direct reclaim pass before falling back to the OOM
-	 * killer. Unlike upstream, we deliberately do NOT re-arm the
-	 * should_reclaim_retry() loop below, so this is exactly one
-	 * try_to_free_pages() invocation: reclaim clean page cache first, and
-	 * only proceed to OOM if that single pass fails to make progress. For
-	 * the order-0 allocations that dominate page-fault pressure,
-	 * should_compact_retry() returns false, so there is no retry path back
-	 * to the 'retry' label and reclaim happens at most once.
+	 * Ordinary allocations get one bounded direct-reclaim pass. A
+	 * latency-critical order-0 allocation already marked __GFP_HIGH skips
+	 * that pass: measurements show that hundreds of individually short
+	 * passes can consume most of a request's wall time. Let it use the
+	 * protected reserve or drive OOM progress instead; BE allocations keep
+	 * reclaiming clean cache exactly as before.
 	 */
-	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
-							&did_some_progress);
-	if (page)
-		goto got_pg;
+	if (!lc_bypass_reclaim) {
+		page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags,
+						   ac, &did_some_progress);
+		if (page)
+			goto got_pg;
+	} else {
+		oom_alloc_trace_lc("event=slowpath_lc_reclaim_bypass pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
+	}
 
 	/* Try direct compaction and then allocating */
 	page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,

@@ -18,6 +18,7 @@
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
+#include <linux/string.h>
 #include <linux/ktime.h>
 #include <linux/tracepoint-defs.h>
 
@@ -33,14 +34,25 @@ static inline bool oom_alloc_trace_enabled(void)
 	return READ_ONCE(sysctl_oom_alloc_trace_printk);
 }
 
-static inline bool oom_alloc_trace_current_lc(void)
+/*
+ * Prototype-only LC classification used by this experiment kernel. Keep the
+ * policy in one helper so reserve access, reclaim bypass, and diagnostics
+ * cannot silently disagree about which serving processes are protected.
+ * A production version should replace comm matching with an explicit cgroup
+ * attribute.
+ */
+static inline bool oom_alloc_current_lc(void)
 {
 	const char *comm = current->comm;
 
-	return oom_alloc_trace_enabled() &&
-		comm[0] == 'l' && comm[1] == 'c' && comm[2] == '_' &&
-		comm[3] == 's' && comm[4] == 'e' && comm[5] == 'r' &&
-		comm[6] == 'v' && comm[7] == 'e' && comm[8] == 'r';
+	return !strcmp(comm, "lc_server") ||
+	       !strcmp(comm, "redis-server") ||
+	       !strcmp(comm, "memcached");
+}
+
+static inline bool oom_alloc_trace_current_lc(void)
+{
+	return oom_alloc_trace_enabled() && oom_alloc_current_lc();
 }
 
 #define oom_alloc_trace_lc(fmt, ...)					\
