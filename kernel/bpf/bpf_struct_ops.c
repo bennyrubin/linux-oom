@@ -55,12 +55,6 @@ struct bpf_struct_ops_map {
 	struct bpf_struct_ops_value kvalue;
 };
 
-struct bpf_struct_ops_link {
-	struct bpf_link link;
-	struct bpf_map __rcu *map;
-	wait_queue_head_t wait_hup;
-};
-
 static DEFINE_MUTEX(update_mutex);
 
 #define VALUE_PREFIX "bpf_struct_ops_"
@@ -1386,4 +1380,11 @@ void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map
 	struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
 
 	info->btf_vmlinux_id = btf_obj_id(st_map->btf);
+}
+
+void *bpf_struct_ops_data(struct bpf_map *map)
+{
+	struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
+
+	return &st_map->kvalue.data;
 }
