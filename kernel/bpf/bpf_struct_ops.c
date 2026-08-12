@@ -993,7 +993,7 @@ static void bpf_struct_ops_map_free(struct bpf_map *map)
 	 * in the tramopline image to finish before releasing
 	 * the trampoline image.
 	 */
-	synchronize_rcu_mult(call_rcu, call_rcu_tasks);
+	synchronize_rcu_mult(call_rcu, call_rcu_tasks, call_rcu_tasks_trace);
 
 	__bpf_struct_ops_map_free(map);
 }
@@ -1196,7 +1196,8 @@ static void bpf_struct_ops_map_link_dealloc(struct bpf_link *link)
 	if (st_link->cgroup)
 		cgroup_bpf_detach_struct_ops(st_link->cgroup, st_link);
 
-	kfree(st_link);
+	synchronize_rcu_tasks_trace();
+	kfree_rcu(st_link, link.rcu);
 }
 
 static void bpf_struct_ops_map_link_show_fdinfo(const struct bpf_link *link,
