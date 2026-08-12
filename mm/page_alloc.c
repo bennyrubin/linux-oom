@@ -4440,7 +4440,10 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
 	bool can_compact = gfp_compaction_allowed(gfp_mask);
 	bool nofail = gfp_mask & __GFP_NOFAIL;
-	bool lc_bypass_reclaim = oom_alloc_current_lc();
+	bool lc_reserve = in_task() && current->mm &&
+			  oom_alloc_current_lc() &&
+			  !(gfp_mask & __GFP_NOMEMALLOC);
+	bool lc_bypass_reclaim = lc_reserve;
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -4452,6 +4455,15 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	unsigned int cpuset_mems_cookie;
 	unsigned int zonelist_iter_cookie;
 	int reserve_flags;
+
+	/*
+	 * Apply the LC priority centrally after the ordinary fast path has
+	 * failed. This covers every eligible allocation made synchronously in
+	 * an LC task, including kernel allocations made on its behalf, while
+	 * preserving explicit __GFP_NOMEMALLOC callers and interrupt context.
+	 */
+	if (lc_reserve)
+		gfp_mask |= __GFP_HIGH;
 
 	oom_alloc_trace_lc("event=slowpath_enter pid=%d tgid=%d order=%u gfp=%x\n",
 			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
