@@ -278,6 +278,19 @@ static int watermark_boost_factor __read_mostly = 15000;
 static int watermark_scale_factor = 10;
 int defrag_mode;
 int sysctl_oom_alloc_trace_printk __read_mostly;
+int sysctl_lc_reserve_kbytes __read_mostly = 8192;
+int sysctl_lc_order0_reserve_kbytes __read_mostly = 2048;
+
+enum lc_oom_state {
+	LC_OOM_IDLE,
+	LC_OOM_PENDING,
+	LC_OOM_TRIGGERING,
+	LC_OOM_WAITING,
+};
+
+static DEFINE_SPINLOCK(lc_oom_state_lock);
+static enum lc_oom_state lc_oom_state;
+static struct mm_struct *lc_oom_inflight_mm;
 
 /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
 int movable_zone;
@@ -3316,6 +3329,20 @@ static inline long __zone_watermark_unusable_free(struct zone *z,
 	return unusable_free;
 }
 
+static inline unsigned long lc_watermark_reserve(struct zone *z,
+						 unsigned int order,
+						 unsigned int alloc_flags)
+{
+	if (alloc_flags & ALLOC_LC)
+		return order ? READ_ONCE(z->lc_order0_reserve_pages) : 0;
+
+	/* Preserve the kernel's existing atomic and OOM-victim reserves. */
+	if (alloc_flags & (ALLOC_HIGHATOMIC | ALLOC_OOM))
+		return 0;
+
+	return READ_ONCE(z->lc_reserve_pages);
+}
+
 /*
  * Return true if free base pages are above 'mark'. For high-order checks it
  * will return true of the order-0 watermark is reached and there is at least
@@ -3337,7 +3364,10 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 		 * __GFP_HIGH allows access to 50% of the min reserve as well
 		 * as OOM.
 		 */
-		if (alloc_flags & ALLOC_MIN_RESERVE) {
+		if ((alloc_flags & ALLOC_MIN_RESERVE) &&
+		    !(alloc_flags & ALLOC_LC) &&
+		    (!READ_ONCE(z->lc_reserve_pages) ||
+		     (alloc_flags & (ALLOC_HIGHATOMIC | ALLOC_OOM)))) {
 			min -= min / 2;
 
 			/*
@@ -3360,6 +3390,8 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 		if (alloc_flags & ALLOC_OOM)
 			min -= min / 2;
 	}
+
+	min += lc_watermark_reserve(z, order, alloc_flags);
 
 	/*
 	 * Check watermarks for an order-0 allocation request. If these
@@ -3419,16 +3451,18 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 * Fast check for order-0 only. If this fails then the reserves
 	 * need to be calculated.
 	 */
-	if (!order) {
+	if (!order && !(alloc_flags & ALLOC_RESERVES)) {
 		long usable_free;
 		long reserved;
+		long fast_mark = mark + lc_watermark_reserve(z, order,
+							      alloc_flags);
 
 		usable_free = free_pages;
 		reserved = __zone_watermark_unusable_free(z, 0, alloc_flags);
 
 		/* reserved may over estimate high-atomic reserves. */
 		usable_free -= min(usable_free, reserved);
-		if (usable_free > mark + z->lowmem_reserve[highest_zoneidx])
+		if (usable_free > fast_mark + z->lowmem_reserve[highest_zoneidx])
 			return true;
 	}
 
@@ -3436,14 +3470,23 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 					free_pages))
 		return true;
 
+	/* LC allocations must reach their unboosted dedicated reserve. */
+	if (unlikely((alloc_flags & ALLOC_LC) && z->watermark_boost &&
+		     ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
+		mark = z->_watermark[WMARK_MIN];
+		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
+					alloc_flags, free_pages);
+	}
+
 	/*
 	 * Ignore watermark boosting for __GFP_HIGH order-0 allocations
 	 * when checking the min watermark. The min watermark is the
 	 * point where boosting is ignored so that kswapd is woken up
 	 * when below the low watermark.
 	 */
-	if (unlikely(!order && (alloc_flags & ALLOC_MIN_RESERVE) && z->watermark_boost
-		&& ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
+	if (unlikely(!order && (alloc_flags & ALLOC_MIN_RESERVE) &&
+		     z->watermark_boost &&
+		     ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
 		mark = z->_watermark[WMARK_MIN];
 		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
 					alloc_flags, free_pages);
@@ -4442,7 +4485,9 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool nofail = gfp_mask & __GFP_NOFAIL;
 	bool lc_reserve = in_task() && current->mm &&
 			  oom_alloc_current_lc() &&
-			  !(gfp_mask & __GFP_NOMEMALLOC);
+			  order <= PAGE_ALLOC_COSTLY_ORDER &&
+			  !(gfp_mask & __GFP_NOMEMALLOC) &&
+			  READ_ONCE(sysctl_lc_reserve_kbytes);
 	bool lc_bypass_reclaim = lc_reserve;
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
@@ -4455,15 +4500,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	unsigned int cpuset_mems_cookie;
 	unsigned int zonelist_iter_cookie;
 	int reserve_flags;
-
-	/*
-	 * Apply the LC priority centrally after the ordinary fast path has
-	 * failed. This covers every eligible allocation made synchronously in
-	 * an LC task, including kernel allocations made on its behalf, while
-	 * preserving explicit __GFP_NOMEMALLOC callers and interrupt context.
-	 */
-	if (lc_reserve)
-		gfp_mask |= __GFP_HIGH;
 
 	oom_alloc_trace_lc("event=slowpath_enter pid=%d tgid=%d order=%u gfp=%x\n",
 			   current->pid, current->tgid, order, (__force unsigned int)gfp_mask);
@@ -4501,6 +4537,8 @@ restart:
 	 * alloc_flags precisely. So we do that now.
 	 */
 	alloc_flags = gfp_to_alloc_flags(gfp_mask, order);
+	if (lc_reserve)
+		alloc_flags |= ALLOC_LC;
 
 	/*
 	 * We need to recalculate the starting point for the zonelist iterator
@@ -4608,7 +4646,7 @@ retry:
 	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
 	if (reserve_flags)
 		alloc_flags = gfp_to_alloc_flags_cma(gfp_mask, reserve_flags) |
-					  (alloc_flags & ALLOC_KSWAPD);
+					  (alloc_flags & (ALLOC_KSWAPD | ALLOC_LC));
 
 	/*
 	 * Reset the nodemask and zonelist iterators if memory policies can be
@@ -4775,6 +4813,110 @@ got_pg:
 			   (__force unsigned int)gfp_mask, page != NULL,
 			   did_some_progress);
 	return page;
+}
+
+static bool lc_allocation_in_reserve(struct page *page, gfp_t gfp_mask,
+				     unsigned int order,
+				     const struct alloc_context *ac)
+{
+	struct zone *zone = page_zone(page);
+	unsigned int alloc_flags = ALLOC_WMARK_MIN;
+	long free_pages;
+
+	if (!READ_ONCE(zone->lc_reserve_pages))
+		return false;
+
+	alloc_flags = gfp_to_alloc_flags_cma(gfp_mask, alloc_flags);
+
+	free_pages = zone_page_state(zone, NR_FREE_PAGES);
+	free_pages -= __zone_watermark_unusable_free(zone, order, alloc_flags);
+
+	return free_pages <= READ_ONCE(zone->_watermark[WMARK_MIN]) +
+		READ_ONCE(zone->lc_reserve_pages) +
+		zone->lowmem_reserve[ac->highest_zoneidx];
+}
+
+static bool lc_oom_safe(gfp_t gfp_mask, unsigned int order)
+{
+	return in_task() && current->mm &&
+		order <= PAGE_ALLOC_COSTLY_ORDER &&
+		(gfp_mask & __GFP_DIRECT_RECLAIM) &&
+		(gfp_mask & __GFP_FS) &&
+		!(gfp_mask & __GFP_NOMEMALLOC) &&
+		!(current->flags & (PF_MEMALLOC | PF_DUMPCORE));
+}
+
+static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
+				 unsigned int order,
+				 const struct alloc_context *ac)
+{
+	struct mm_struct *old_mm = NULL;
+	struct oom_control oc = {
+		.zonelist = ac->zonelist,
+		.nodemask = ac->nodemask,
+		.memcg = NULL,
+		.gfp_mask = gfp_mask,
+		.order = order,
+		.defer_victim_boost = true,
+		.track_inflight = true,
+	};
+	unsigned long flags;
+
+	if (!lc_oom_safe(gfp_mask, order)) {
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		if (lc_oom_state == LC_OOM_IDLE)
+			lc_oom_state = LC_OOM_PENDING;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		return;
+	}
+
+	spin_lock_irqsave(&lc_oom_state_lock, flags);
+	if (lc_oom_state == LC_OOM_TRIGGERING) {
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		count_vm_event(LC_OOM_COALESCED);
+		return;
+	}
+	if (lc_oom_state == LC_OOM_WAITING &&
+	    !test_bit(MMF_OOM_SKIP, &lc_oom_inflight_mm->flags)) {
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		count_vm_event(LC_OOM_COALESCED);
+		return;
+	}
+	if (lc_oom_state == LC_OOM_WAITING) {
+		old_mm = lc_oom_inflight_mm;
+		lc_oom_inflight_mm = NULL;
+	}
+	lc_oom_state = LC_OOM_TRIGGERING;
+	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+
+	if (old_mm)
+		mmdrop(old_mm);
+
+	mutex_lock(&oom_lock);
+	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
+		mutex_unlock(&oom_lock);
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		lc_oom_state = LC_OOM_IDLE;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		return;
+	}
+
+	count_vm_event(LC_OOM_TRIGGER);
+	oom_alloc_trace_lc("event=lc_reserve_oom_start pid=%d tgid=%d order=%u gfp=%x\n",
+			   current->pid, current->tgid, order,
+			   (__force unsigned int)gfp_mask);
+	out_of_memory(&oc);
+	mutex_unlock(&oom_lock);
+	oom_boost_deferred_victim(&oc);
+
+	spin_lock_irqsave(&lc_oom_state_lock, flags);
+	lc_oom_inflight_mm = oc.inflight_mm;
+	lc_oom_state = oc.inflight_mm ? LC_OOM_WAITING : LC_OOM_PENDING;
+	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+
+	oom_alloc_trace_lc("event=lc_reserve_oom_done pid=%d tgid=%d inflight=%d\n",
+			   current->pid, current->tgid,
+			   !!oc.inflight_mm);
 }
 
 static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
@@ -5002,6 +5144,8 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
 	struct alloc_context ac = { };
+	bool lc_alloc;
+	bool used_slowpath = false;
 
 	/*
 	 * There are several places where we assume that the order value is sane
@@ -5019,10 +5163,18 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	 * movable zones are not used during allocation.
 	 */
 	gfp = current_gfp_context(gfp);
+	lc_alloc = in_task() && current->mm && oom_alloc_current_lc() &&
+		   order <= PAGE_ALLOC_COSTLY_ORDER &&
+		   !(gfp & __GFP_NOMEMALLOC) &&
+		   READ_ONCE(sysctl_lc_reserve_kbytes);
 	alloc_gfp = gfp;
 	if (!prepare_alloc_pages(gfp, order, preferred_nid, nodemask, &ac,
 			&alloc_gfp, &alloc_flags))
 		return NULL;
+	if (lc_alloc) {
+		alloc_flags &= ~ALLOC_WMARK_MASK;
+		alloc_flags |= ALLOC_WMARK_MIN | ALLOC_LC;
+	}
 
 	/*
 	 * Forbid the first pass from falling back to types that fragment
@@ -5040,6 +5192,7 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 
 	alloc_gfp = gfp;
 	ac.spread_dirty_pages = false;
+	used_slowpath = true;
 
 	/*
 	 * Restore the original nodemask if it was potentially replaced with
@@ -5058,6 +5211,23 @@ out:
 
 	trace_mm_page_alloc(page, order, alloc_gfp, ac.migratetype);
 	kmsan_alloc_page(page, order, alloc_gfp);
+
+	if (lc_alloc) {
+		if (!page) {
+			count_vm_event(LC_RESERVE_EXHAUSTED);
+			if (order)
+				count_vm_event(LC_HIGHORDER_FALLBACK);
+		} else {
+			if (!used_slowpath)
+				count_vm_event(LC_ALLOC_FAST);
+			if (lc_allocation_in_reserve(page, gfp, order, &ac)) {
+				count_vm_event(LC_RESERVE_HIT);
+				if (order)
+					count_vm_event(LC_HIGHORDER_HIT);
+				lc_reserve_maybe_oom(page, gfp, order, &ac);
+			}
+		}
+	}
 
 	return page;
 }
@@ -6185,6 +6355,12 @@ static void setup_per_zone_lowmem_reserve(void)
 static void __setup_per_zone_wmarks(void)
 {
 	unsigned long pages_min = min_free_kbytes >> (PAGE_SHIFT - 10);
+	unsigned long pages_lc = READ_ONCE(sysctl_lc_reserve_kbytes) >>
+				 (PAGE_SHIFT - 10);
+	unsigned long pages_lc_order0 =
+		min_t(unsigned long, pages_lc,
+		      READ_ONCE(sysctl_lc_order0_reserve_kbytes) >>
+				      (PAGE_SHIFT - 10));
 	unsigned long lowmem_pages = 0;
 	struct zone *zone;
 	unsigned long flags;
@@ -6196,11 +6372,16 @@ static void __setup_per_zone_wmarks(void)
 	}
 
 	for_each_zone(zone) {
-		u64 tmp;
+		u64 tmp, lc_tmp, lc_order0_tmp;
 
 		spin_lock_irqsave(&zone->lock, flags);
 		tmp = (u64)pages_min * zone_managed_pages(zone);
 		tmp = div64_ul(tmp, lowmem_pages);
+		lc_tmp = (u64)pages_lc * zone_managed_pages(zone);
+		lc_tmp = div64_ul(lc_tmp, lowmem_pages);
+		lc_order0_tmp = (u64)pages_lc_order0 *
+				zone_managed_pages(zone);
+		lc_order0_tmp = div64_ul(lc_order0_tmp, lowmem_pages);
 		if (is_highmem(zone) || zone_idx(zone) == ZONE_MOVABLE) {
 			/*
 			 * __GFP_HIGH and PF_MEMALLOC allocations usually don't
@@ -6216,12 +6397,16 @@ static void __setup_per_zone_wmarks(void)
 			min_pages = zone_managed_pages(zone) / 1024;
 			min_pages = clamp(min_pages, SWAP_CLUSTER_MAX, 128UL);
 			zone->_watermark[WMARK_MIN] = min_pages;
+			zone->lc_reserve_pages = 0;
+			zone->lc_order0_reserve_pages = 0;
 		} else {
 			/*
 			 * If it's a lowmem zone, reserve a number of pages
 			 * proportionate to the zone's size.
 			 */
 			zone->_watermark[WMARK_MIN] = tmp;
+			zone->lc_reserve_pages = lc_tmp;
+			zone->lc_order0_reserve_pages = lc_order0_tmp;
 		}
 
 		/*
@@ -6244,6 +6429,21 @@ static void __setup_per_zone_wmarks(void)
 
 	/* update totalreserve_pages */
 	calculate_totalreserve_pages();
+}
+
+void setup_per_zone_wmarks(void);
+
+static int lc_reserve_sysctl_handler(const struct ctl_table *table, int write,
+				     void *buffer, size_t *length, loff_t *ppos)
+{
+	int ret;
+
+	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
+	if (ret || !write)
+		return ret;
+
+	setup_per_zone_wmarks();
+	return 0;
 }
 
 /**
@@ -6485,6 +6685,24 @@ out:
 }
 
 static const struct ctl_table page_alloc_sysctl_table[] = {
+	{
+		.procname	= "lc_reserve_kbytes",
+		.data		= &sysctl_lc_reserve_kbytes,
+		.maxlen		= sizeof(sysctl_lc_reserve_kbytes),
+		.mode		= 0644,
+		.proc_handler	= lc_reserve_sysctl_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
+	},
+	{
+		.procname	= "lc_order0_reserve_kbytes",
+		.data		= &sysctl_lc_order0_reserve_kbytes,
+		.maxlen		= sizeof(sysctl_lc_order0_reserve_kbytes),
+		.mode		= 0644,
+		.proc_handler	= lc_reserve_sysctl_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
+	},
 	{
 		.procname	= "min_free_kbytes",
 		.data		= &min_free_kbytes,

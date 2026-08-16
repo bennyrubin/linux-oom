@@ -1339,6 +1339,13 @@ const char * const vmstat_text[] = {
 	"drop_pagecache",
 	"drop_slab",
 	"oom_kill",
+	"lc_alloc_fast",
+	"lc_reserve_hit",
+	"lc_reserve_exhausted",
+	"lc_highorder_hit",
+	"lc_highorder_fallback",
+	"lc_oom_trigger",
+	"lc_oom_coalesced",
 
 #ifdef CONFIG_NUMA_BALANCING
 	"numa_pte_updates",

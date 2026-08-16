@@ -3929,6 +3929,20 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 	mem_cgroup_free(memcg);
 }
 
+static void mem_cgroup_set_latency_critical(struct cgroup_subsys_state *css,
+					    bool value)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	struct css_task_iter it;
+	struct task_struct *task;
+
+	WRITE_ONCE(memcg->latency_critical, value);
+	css_task_iter_start(css, 0, &it);
+	while ((task = css_task_iter_next(&it)))
+		WRITE_ONCE(task->memcg_latency_critical, value);
+	css_task_iter_end(&it);
+}
+
 /**
  * mem_cgroup_css_reset - reset the states of a mem_cgroup
  * @css: the target css
@@ -3945,6 +3959,8 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 static void mem_cgroup_css_reset(struct cgroup_subsys_state *css)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+	mem_cgroup_set_latency_critical(css, false);
 
 	page_counter_set_max(&memcg->memory, PAGE_COUNTER_MAX);
 	page_counter_set_max(&memcg->swap, PAGE_COUNTER_MAX);
@@ -4132,6 +4148,8 @@ static void mem_cgroup_fork(struct task_struct *task)
 	 * current_objcg_update().
 	 */
 	task->objcg = (struct obj_cgroup *)CURRENT_OBJCG_UPDATE_FLAG;
+	task->memcg_latency_critical =
+		READ_ONCE(mem_cgroup_from_task(task)->latency_critical);
 }
 
 static void mem_cgroup_exit(struct task_struct *task)
@@ -4186,8 +4204,32 @@ static void mem_cgroup_kmem_attach(struct cgroup_taskset *tset)
 
 static void mem_cgroup_attach(struct cgroup_taskset *tset)
 {
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+
 	mem_cgroup_lru_gen_attach(tset);
 	mem_cgroup_kmem_attach(tset);
+
+	cgroup_taskset_for_each(task, css, tset)
+		WRITE_ONCE(task->memcg_latency_critical,
+			   READ_ONCE(mem_cgroup_from_css(css)->latency_critical));
+}
+
+static u64 memory_latency_critical_read(struct cgroup_subsys_state *css,
+					struct cftype *cft)
+{
+	return READ_ONCE(mem_cgroup_from_css(css)->latency_critical);
+}
+
+static int memory_latency_critical_write(struct cgroup_subsys_state *css,
+					 struct cftype *cft, u64 value)
+{
+	if (value > 1)
+		return -EINVAL;
+
+	mem_cgroup_set_latency_critical(css, value);
+
+	return 0;
 }
 
 static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
@@ -4646,6 +4688,12 @@ static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,
 }
 
 static struct cftype memory_files[] = {
+	{
+		.name = "latency_critical",
+		.flags = CFTYPE_NOT_ON_ROOT | CFTYPE_NS_DELEGATABLE,
+		.read_u64 = memory_latency_critical_read,
+		.write_u64 = memory_latency_critical_write,
+	},
 	{
 		.name = "current",
 		.flags = CFTYPE_NOT_ON_ROOT,

@@ -77,6 +77,16 @@ static inline bool is_memcg_oom(struct oom_control *oc)
 	return oc->memcg != NULL;
 }
 
+static void oom_control_track_mm(struct oom_control *oc, struct mm_struct *mm)
+{
+	/* Memcg OOM-group members are killed without an oom_control. */
+	if (!oc || !oc->track_inflight || oc->inflight_mm || !mm)
+		return;
+
+	mmgrab(mm);
+	oc->inflight_mm = mm;
+}
+
 #ifdef CONFIG_NUMA
 /**
  * oom_cpuset_eligible() - check task eligibility for kill
@@ -328,8 +338,11 @@ static int oom_evaluate_task(struct task_struct *task, void *arg)
 	 * any memory is quite low.
 	 */
 	if (!is_sysrq_oom(oc) && tsk_is_oom_victim(task)) {
-		if (test_bit(MMF_OOM_SKIP, &task->signal->oom_mm->flags))
+		struct mm_struct *mm = task->signal->oom_mm;
+
+		if (test_bit(MMF_OOM_SKIP, &mm->flags))
 			goto next;
+		oom_control_track_mm(oc, mm);
 		goto abort;
 	}
 
@@ -1044,6 +1057,7 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	 */
 	do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID);
 	mark_oom_victim(victim);
+	oom_control_track_mm(oc, mm);
 	task_unlock(victim);
 	defer_or_boost_oom_victim(oc, victim);
 
@@ -1113,6 +1127,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	task_lock(victim);
 	if (task_will_free_mem(victim)) {
 		mark_oom_victim(victim);
+		oom_control_track_mm(oc, victim->signal->oom_mm);
 		queue_oom_reaper(victim);
 		task_unlock(victim);
 		defer_or_boost_oom_victim(oc, victim);
@@ -1214,6 +1229,7 @@ bool out_of_memory(struct oom_control *oc)
 	 */
 	if (task_will_free_mem(current)) {
 		mark_oom_victim(current);
+		oom_control_track_mm(oc, current->signal->oom_mm);
 		queue_oom_reaper(current);
 		defer_or_boost_oom_victim(oc, current);
 		return true;

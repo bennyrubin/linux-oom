@@ -862,6 +862,8 @@ struct zone {
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
 	unsigned long _watermark[NR_WMARK];
+	unsigned long lc_reserve_pages;
+	unsigned long lc_order0_reserve_pages;
 	unsigned long watermark_boost;
 
 	unsigned long nr_reserved_highatomic;

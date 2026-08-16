@@ -18,7 +18,6 @@
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
-#include <linux/string.h>
 #include <linux/ktime.h>
 #include <linux/tracepoint-defs.h>
 
@@ -34,20 +33,13 @@ static inline bool oom_alloc_trace_enabled(void)
 	return READ_ONCE(sysctl_oom_alloc_trace_printk);
 }
 
-/*
- * Prototype-only LC classification used by this experiment kernel. Keep the
- * policy in one helper so reserve access, reclaim bypass, and diagnostics
- * cannot silently disagree about which serving processes are protected.
- * A production version should replace comm matching with an explicit cgroup
- * attribute.
- */
 static inline bool oom_alloc_current_lc(void)
 {
-	const char *comm = current->comm;
-
-	return !strcmp(comm, "lc_server") ||
-	       !strcmp(comm, "redis-server") ||
-	       !strcmp(comm, "memcached");
+#ifdef CONFIG_MEMCG
+	return READ_ONCE(current->memcg_latency_critical);
+#else
+	return false;
+#endif
 }
 
 static inline bool oom_alloc_trace_current_lc(void)
@@ -1313,6 +1305,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 #define ALLOC_HIGHATOMIC	0x200 /* Allows access to MIGRATE_HIGHATOMIC */
 #define ALLOC_TRYLOCK		0x400 /* Only use spin_trylock in allocation path */
 #define ALLOC_KSWAPD		0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */
+#define ALLOC_LC		0x1000 /* latency-critical allocation; may use LC reserve */
 
 /* Flags that allow allocations below the min watermark. */
 #define ALLOC_RESERVES (ALLOC_NON_BLOCK|ALLOC_MIN_RESERVE|ALLOC_HIGHATOMIC|ALLOC_OOM)

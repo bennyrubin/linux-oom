@@ -1321,6 +1321,10 @@ struct task_struct {
 	struct css_set __rcu		*cgroups;
 	/* cg_list protected by css_set_lock and tsk->alloc_lock: */
 	struct list_head		cg_list;
+#ifdef CONFIG_MEMCG
+	/* Cached memory.latency_critical value for the page allocator. */
+	bool				memcg_latency_critical;
+#endif
 #endif
 #ifdef CONFIG_X86_CPU_RESCTRL
 	u32				closid;

@@ -2469,10 +2469,6 @@ struct folio *vma_alloc_folio_noprof(gfp_t gfp, int order, struct vm_area_struct
 	if (vma->vm_flags & VM_DROPPABLE)
 		gfp |= __GFP_NOWARN;
 
-	if (order == 0 && current->mm == vma->vm_mm &&
-	    oom_alloc_current_lc())
-		gfp |= __GFP_HIGH;
-
 	pol = get_vma_policy(vma, addr, order, &ilx);
 	folio = folio_alloc_mpol_noprof(gfp, order, pol, ilx, numa_node_id());
 	mpol_cond_put(pol);

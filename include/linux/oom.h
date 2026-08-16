@@ -49,8 +49,10 @@ struct oom_control {
 	unsigned long totalpages;
 	struct task_struct *chosen;
 	struct task_struct *boosted;
+	struct mm_struct *inflight_mm;
 	long chosen_points;
 	bool defer_victim_boost;
+	bool track_inflight;
 
 	/* Used to print the constraint info. */
 	enum oom_constraint constraint;

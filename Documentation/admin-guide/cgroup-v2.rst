@@ -1264,6 +1264,13 @@ All memory amounts are in bytes.  If a value which is not aligned to
 PAGE_SIZE is written, the value may be rounded up to the closest
 PAGE_SIZE multiple when read back.
 
+  memory.latency_critical
+	A read-write single value file which exists on non-root cgroups.
+	The default is "0".  Setting it to "1" grants tasks directly in the
+	cgroup access to the latency-critical page allocator reserve.  The
+	setting is local rather than hierarchical; child cgroups must be
+	labeled separately.
+
   memory.current
 	A read-only single value file which exists on non-root
 	cgroups.

@@ -225,6 +225,7 @@ struct mem_cgroup {
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
 	 */
 	bool oom_group;
+	bool latency_critical;
 
 	int swappiness;
 

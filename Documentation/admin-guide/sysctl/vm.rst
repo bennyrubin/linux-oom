@@ -43,6 +43,8 @@ Currently, these files are in /proc/sys/vm:
 - hugetlb_shm_group
 - laptop_mode
 - legacy_va_layout
+- lc_order0_reserve_kbytes
+- lc_reserve_kbytes
 - lowmem_reserve_ratio
 - max_map_count
 - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
@@ -547,6 +549,23 @@ allocations; if you set this to lower than 1024KB, your system will
 become subtly broken, and prone to deadlock under high loads.
 
 Setting this too high will OOM your machine instantly.
+
+
+lc_reserve_kbytes
+=================
+
+The amount of free memory reserved for tasks in a cgroup with
+``memory.latency_critical`` set to 1.  The reserve is distributed across
+lowmem zones in proportion to their managed pages.  Ordinary allocations
+reclaim and invoke OOM before consuming it.  The default is 8192 KiB.
+
+
+lc_order0_reserve_kbytes
+========================
+
+The portion of ``lc_reserve_kbytes`` retained for order-0 latency-critical
+allocations.  Latency-critical allocations of orders 1 through 3 cannot
+consume this final portion.  The default is 2048 KiB.
 
 
 min_slab_ratio
