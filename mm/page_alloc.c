@@ -4483,12 +4483,18 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
 	bool can_compact = gfp_compaction_allowed(gfp_mask);
 	bool nofail = gfp_mask & __GFP_NOFAIL;
+	/*
+	 * Direct-reclaim bypass is the base LC policy and must not depend on
+	 * whether a dedicated reserve is configured.  A zero-sized dedicated
+	 * reserve should therefore retain the behavior of the parent LC
+	 * solution rather than silently reverting to direct reclaim.
+	 */
+	bool lc_bypass_reclaim = oom_alloc_current_lc();
 	bool lc_reserve = in_task() && current->mm &&
 			  oom_alloc_current_lc() &&
 			  order <= PAGE_ALLOC_COSTLY_ORDER &&
 			  !(gfp_mask & __GFP_NOMEMALLOC) &&
 			  READ_ONCE(sysctl_lc_reserve_kbytes);
-	bool lc_bypass_reclaim = lc_reserve;
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
