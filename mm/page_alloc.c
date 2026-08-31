@@ -1666,7 +1666,15 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	bool init = !want_init_on_free() && want_init_on_alloc(gfp_flags) &&
 			!should_skip_init(gfp_flags);
 	bool zero_tags = init && (gfp_flags & __GFP_ZEROTAGS);
+	bool trace_lc_prepare = trace_mm_lc_page_prepare_enabled() &&
+				oom_alloc_current_lc();
+	u64 prepare_start_ns = 0;
+	u64 zero_start_ns = 0;
+	u64 zero_ns = 0;
 	int i;
+
+	if (trace_lc_prepare)
+		prepare_start_ns = ktime_get_mono_fast_ns();
 
 	set_page_private(page, 0);
 
@@ -1712,12 +1720,21 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 			page_kasan_tag_reset(page + i);
 	}
 	/* If memory is still not initialized, initialize it now. */
-	if (init)
+	if (init) {
+		if (trace_lc_prepare)
+			zero_start_ns = ktime_get_mono_fast_ns();
 		kernel_init_pages(page, 1 << order);
+		if (trace_lc_prepare)
+			zero_ns = ktime_get_mono_fast_ns() - zero_start_ns;
+	}
 
 	set_page_owner(page, order, gfp_flags);
 	page_table_check_alloc(page, order);
 	pgalloc_tag_add(page, current, 1 << order);
+
+	if (trace_lc_prepare)
+		trace_mm_lc_page_prepare(page, order, gfp_flags,
+			ktime_get_mono_fast_ns() - prepare_start_ns, zero_ns);
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,

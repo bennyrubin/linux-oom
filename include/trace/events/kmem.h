@@ -203,6 +203,43 @@ TRACE_EVENT(mm_page_alloc,
 		show_gfp_flags(__entry->gfp_flags))
 );
 
+/*
+ * Diagnostic split for latency-critical page preparation.  This tracepoint is
+ * emitted only for LC allocations and only while a consumer has enabled it,
+ * so the normal allocation path pays only the disabled static-key check.
+ */
+TRACE_EVENT(mm_lc_page_prepare,
+
+	TP_PROTO(struct page *page, unsigned int order, gfp_t gfp_flags,
+		 u64 duration_ns, u64 zero_ns),
+
+	TP_ARGS(page, order, gfp_flags, duration_ns, zero_ns),
+
+	TP_STRUCT__entry(
+		__field(	unsigned long,	pfn		)
+		__field(	unsigned int,	order		)
+		__field(	unsigned long,	gfp_flags	)
+		__field(	u64,		duration_ns	)
+		__field(	u64,		zero_ns		)
+	),
+
+	TP_fast_assign(
+		__entry->pfn = page ? page_to_pfn(page) : -1UL;
+		__entry->order = order;
+		__entry->gfp_flags = (__force unsigned long)gfp_flags;
+		__entry->duration_ns = duration_ns;
+		__entry->zero_ns = zero_ns;
+	),
+
+	TP_printk("page=%p pfn=0x%lx order=%u gfp_flags=%s duration_ns=%llu zero_ns=%llu",
+		__entry->pfn != -1UL ? pfn_to_page(__entry->pfn) : NULL,
+		__entry->pfn != -1UL ? __entry->pfn : 0,
+		__entry->order,
+		show_gfp_flags(__entry->gfp_flags),
+		__entry->duration_ns,
+		__entry->zero_ns)
+);
+
 DECLARE_EVENT_CLASS(mm_page,
 
 	TP_PROTO(struct page *page, unsigned int order, int migratetype,
