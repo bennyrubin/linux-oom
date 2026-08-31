@@ -278,6 +278,7 @@ static int watermark_boost_factor __read_mostly = 15000;
 static int watermark_scale_factor = 10;
 int defrag_mode;
 int sysctl_oom_alloc_trace_printk __read_mostly;
+int sysctl_lc_alloc_diag __read_mostly;
 int sysctl_lc_reserve_kbytes __read_mostly = 8192;
 int sysctl_lc_order0_reserve_kbytes __read_mostly = 2048;
 
@@ -1668,12 +1669,15 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	bool zero_tags = init && (gfp_flags & __GFP_ZEROTAGS);
 	bool trace_lc_prepare = trace_mm_lc_page_prepare_enabled() &&
 				oom_alloc_current_lc();
+	bool diag_lc_prepare = READ_ONCE(sysctl_lc_alloc_diag) &&
+				oom_alloc_current_lc();
+	bool measure_lc_prepare = trace_lc_prepare || diag_lc_prepare;
 	u64 prepare_start_ns = 0;
 	u64 zero_start_ns = 0;
 	u64 zero_ns = 0;
 	int i;
 
-	if (trace_lc_prepare)
+	if (measure_lc_prepare)
 		prepare_start_ns = ktime_get_mono_fast_ns();
 
 	set_page_private(page, 0);
@@ -1721,10 +1725,10 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	}
 	/* If memory is still not initialized, initialize it now. */
 	if (init) {
-		if (trace_lc_prepare)
+		if (measure_lc_prepare)
 			zero_start_ns = ktime_get_mono_fast_ns();
 		kernel_init_pages(page, 1 << order);
-		if (trace_lc_prepare)
+		if (measure_lc_prepare)
 			zero_ns = ktime_get_mono_fast_ns() - zero_start_ns;
 	}
 
@@ -1732,9 +1736,17 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	page_table_check_alloc(page, order);
 	pgalloc_tag_add(page, current, 1 << order);
 
-	if (trace_lc_prepare)
-		trace_mm_lc_page_prepare(page, order, gfp_flags,
-			ktime_get_mono_fast_ns() - prepare_start_ns, zero_ns);
+	if (measure_lc_prepare) {
+		u64 prepare_ns = ktime_get_mono_fast_ns() - prepare_start_ns;
+
+		if (diag_lc_prepare) {
+			count_vm_events(LC_DIAG_PREP_NS, prepare_ns);
+			count_vm_events(LC_DIAG_ZERO_NS, zero_ns);
+		}
+		if (trace_lc_prepare)
+			trace_mm_lc_page_prepare(page, order, gfp_flags,
+				prepare_ns, zero_ns);
+	}
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
@@ -3608,6 +3620,9 @@ retry:
 					ac->nodemask) {
 		struct page *page;
 		unsigned long mark;
+		u64 rmqueue_start_ns = 0;
+		bool diag_lc_rmqueue = READ_ONCE(sysctl_lc_alloc_diag) &&
+					oom_alloc_current_lc();
 
 		if (cpusets_enabled() &&
 			(alloc_flags & ALLOC_CPUSET) &&
@@ -3724,8 +3739,13 @@ check_alloc_wmark:
 		}
 
 try_this_zone:
+		if (diag_lc_rmqueue)
+			rmqueue_start_ns = ktime_get_mono_fast_ns();
 		page = rmqueue(zonelist_zone(ac->preferred_zoneref), zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
+		if (diag_lc_rmqueue)
+			count_vm_events(LC_DIAG_RMQUEUE_NS,
+				ktime_get_mono_fast_ns() - rmqueue_start_ns);
 		if (page) {
 			prep_new_page(page, order, gfp_mask, alloc_flags);
 
@@ -5168,7 +5188,9 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
 	struct alloc_context ac = { };
 	bool lc_alloc;
+	bool diag_lc_alloc;
 	bool used_slowpath = false;
+	u64 alloc_start_ns = 0;
 
 	/*
 	 * There are several places where we assume that the order value is sane
@@ -5190,6 +5212,12 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 		   order <= PAGE_ALLOC_COSTLY_ORDER &&
 		   !(gfp & __GFP_NOMEMALLOC) &&
 		   READ_ONCE(sysctl_lc_reserve_kbytes);
+	diag_lc_alloc = READ_ONCE(sysctl_lc_alloc_diag) && in_task() &&
+			current->mm && oom_alloc_current_lc() &&
+			order <= PAGE_ALLOC_COSTLY_ORDER &&
+			!(gfp & __GFP_NOMEMALLOC);
+	if (diag_lc_alloc)
+		alloc_start_ns = ktime_get_mono_fast_ns();
 	alloc_gfp = gfp;
 	if (!prepare_alloc_pages(gfp, order, preferred_nid, nodemask, &ac,
 			&alloc_gfp, &alloc_flags))
@@ -5250,6 +5278,11 @@ out:
 				lc_reserve_maybe_oom(page, gfp, order, &ac);
 			}
 		}
+	}
+	if (diag_lc_alloc) {
+		count_vm_event(LC_DIAG_ALLOC_COUNT);
+		count_vm_events(LC_DIAG_ALLOC_NS,
+			ktime_get_mono_fast_ns() - alloc_start_ns);
 	}
 
 	return page;
@@ -6708,6 +6741,15 @@ out:
 }
 
 static const struct ctl_table page_alloc_sysctl_table[] = {
+	{
+		.procname	= "lc_alloc_diag",
+		.data		= &sysctl_lc_alloc_diag,
+		.maxlen		= sizeof(sysctl_lc_alloc_diag),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
 	{
 		.procname	= "lc_reserve_kbytes",
 		.data		= &sysctl_lc_reserve_kbytes,

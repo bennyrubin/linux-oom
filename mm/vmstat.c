@@ -1346,6 +1346,11 @@ const char * const vmstat_text[] = {
 	"lc_highorder_fallback",
 	"lc_oom_trigger",
 	"lc_oom_coalesced",
+	"lc_diag_alloc_count",
+	"lc_diag_alloc_ns",
+	"lc_diag_rmqueue_ns",
+	"lc_diag_prep_ns",
+	"lc_diag_zero_ns",
 
 #ifdef CONFIG_NUMA_BALANCING
 	"numa_pte_updates",
