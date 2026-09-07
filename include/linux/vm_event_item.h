@@ -62,6 +62,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
 		OOM_KILL,
 		LC_ALLOC_FAST,
 		LC_RESERVE_HIT,
+		/* Once per eligible LC allocation: initial miss or final failure. */
 		LC_RESERVE_EXHAUSTED,
 		LC_HIGHORDER_HIT,
 		LC_HIGHORDER_FALLBACK,

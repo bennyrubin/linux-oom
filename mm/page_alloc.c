@@ -5237,6 +5237,9 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
 	if (likely(page))
 		goto out;
+	/* Count the initial miss even if a slowpath retry eventually succeeds. */
+	if (lc_alloc)
+		count_vm_event(LC_RESERVE_EXHAUSTED);
 	oom_alloc_trace_lc("event=alloc_fast_fail pid=%d tgid=%d order=%u gfp=%x flags=%x\n",
 			   current->pid, current->tgid, order,
 			   (__force unsigned int)alloc_gfp, alloc_flags);
@@ -5265,7 +5268,12 @@ out:
 
 	if (lc_alloc) {
 		if (!page) {
-			count_vm_event(LC_RESERVE_EXHAUSTED);
+			/*
+			 * Slowpath allocations were counted at their initial miss.
+			 * Still count a fast-path page rejected by memcg charge.
+			 */
+			if (!used_slowpath)
+				count_vm_event(LC_RESERVE_EXHAUSTED);
 			if (order)
 				count_vm_event(LC_HIGHORDER_FALLBACK);
 		} else {
