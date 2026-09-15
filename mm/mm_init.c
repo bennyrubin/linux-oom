@@ -1426,6 +1426,13 @@ static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx,
 	zone->name = zone_names[idx];
 	zone->zone_pgdat = NODE_DATA(nid);
 	spin_lock_init(&zone->lock);
+	spin_lock_init(&zone->exp_lock);
+	atomic_set(&zone->exp_lc_pending, 0);
+	atomic_long_set(&zone->exp_lc_admissions, 0);
+	atomic_long_set(&zone->exp_be_fallbacks, 0);
+	zone->exp_count = zone->exp_peak = 0;
+	for (int mt = 0; mt < MIGRATE_PCPTYPES; mt++)
+		INIT_LIST_HEAD(&zone->exp_pages[mt]);
 	zone_seqlock_init(zone);
 	zone_pcp_init(zone);
 }

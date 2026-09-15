@@ -858,6 +858,14 @@ enum zone_type {
 #define ASYNC_AND_SYNC 2
 
 struct zone {
+	/* Tiny allocator experiment cache; order-0 PCP-state pages, not buddy. */
+	spinlock_t exp_lock;
+	struct list_head exp_pages[MIGRATE_PCPTYPES];
+	atomic_t exp_lc_pending;
+	atomic_long_t exp_lc_admissions, exp_be_fallbacks;
+	unsigned int exp_count, exp_peak;
+	unsigned long exp_deposited, exp_taken, exp_misses, exp_drained;
+
 	/* Read-mostly fields */
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */

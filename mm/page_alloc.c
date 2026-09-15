@@ -57,6 +57,8 @@
 #include <linux/pgalloc_tag.h>
 #include <asm/div64.h>
 #include "internal.h"
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include "shuffle.h"
 #include "page_reporting.h"
 
@@ -1308,6 +1310,187 @@ __always_inline bool free_pages_prepare(struct page *page,
  * Assumes all pages on list are in same zone.
  * count is the number of pages to free.
  */
+/* Isolated-VM research prototype, disabled by default. */
+static int exp_mode;
+static int exp_batch;
+static int exp_cache_kb;
+static int exp_rx_cpu = -1;
+static int exp_minus_one = -1;
+static int exp_mode_max = 2;
+static int exp_batch_max = 256;
+static int exp_cache_max = 64;
+static DEFINE_MUTEX(exp_config_lock);
+
+static bool exp_is_lc(void)
+{
+	if (in_task())
+		return current->mm && oom_alloc_current_lc();
+	return in_serving_softirq() &&
+		raw_smp_processor_id() == READ_ONCE(exp_rx_cpu);
+}
+
+/* All caller paths retain irqsave semantics. No sleeping or waiter allocation. */
+static noinline unsigned long exp_zone_lock(struct zone *zone)
+{
+	unsigned long flags;
+	int spins;
+
+	local_irq_save(flags);
+	if (READ_ONCE(exp_mode) != 1) {
+		spin_lock(&zone->lock);
+		return flags;
+	}
+	if (exp_is_lc()) {
+		atomic_inc_return(&zone->exp_lc_pending);
+		spin_lock(&zone->lock);
+		atomic_dec(&zone->exp_lc_pending);
+		atomic_long_inc(&zone->exp_lc_admissions);
+		return flags;
+	}
+	for (spins = 0; spins < 4096; spins++) {
+		if (!atomic_read(&zone->exp_lc_pending) && spin_trylock(&zone->lock)) {
+			if (!atomic_read(&zone->exp_lc_pending))
+				return flags;
+			spin_unlock(&zone->lock);
+		}
+		cpu_relax();
+	}
+	/* Finite deferral: no unbounded BE starvation if an LC vCPU stalls. */
+	atomic_long_inc(&zone->exp_be_fallbacks);
+	spin_lock(&zone->lock);
+	return flags;
+}
+
+static noinline void exp_zone_unlock(struct zone *zone, unsigned long flags)
+{
+	spin_unlock_irqrestore(&zone->lock, flags);
+}
+
+/* Called with PCP locked, but never with zone->lock held. */
+static void exp_capture_pcp(struct zone *zone, struct per_cpu_pages *pcp, int *count)
+{
+	unsigned long flags;
+	int mt, cap = READ_ONCE(exp_cache_kb) >> (PAGE_SHIFT - 10);
+
+	if (READ_ONCE(exp_mode) != 2 || !cap || READ_ONCE(zone->exp_count) >= cap)
+		return;
+	if (!spin_trylock_irqsave(&zone->exp_lock, flags))
+		return;
+	/* Recheck under the pool lock, including concurrent disable/resize. */
+	cap = READ_ONCE(exp_mode) == 2 ?
+		READ_ONCE(exp_cache_kb) >> (PAGE_SHIFT - 10) : 0;
+	for (mt = 0; mt < MIGRATE_PCPTYPES && zone->exp_count < cap; mt++) {
+		struct list_head *src = &pcp->lists[order_to_pindex(mt, 0)];
+		while (*count > 0 && zone->exp_count < cap && !list_empty(src)) {
+			struct page *page = list_last_entry(src, struct page, pcp_list);
+			int actual = get_pageblock_migratetype(page);
+			if (actual >= MIGRATE_PCPTYPES)
+				break;
+			list_move(&page->pcp_list, &zone->exp_pages[actual]);
+			pcp->count--;
+			(*count)--;
+			zone->exp_count++;
+			zone->exp_deposited++;
+			zone->exp_peak = max(zone->exp_peak, zone->exp_count);
+		}
+	}
+	spin_unlock_irqrestore(&zone->exp_lock, flags);
+}
+
+static noinline int exp_take(struct zone *zone, unsigned int order, int mt,
+		    unsigned long count, struct list_head *dst)
+{
+	unsigned long flags;
+	int n = 0;
+
+	if (READ_ONCE(exp_mode) != 2 || order || mt >= MIGRATE_PCPTYPES || !exp_is_lc())
+		return 0;
+	if (!spin_trylock_irqsave(&zone->exp_lock, flags))
+		return 0;
+	/* Caller consumes this page while PCP remains locked. No cache surplus
+	 * enters a shared PCP where a later BE request could consume it. */
+	while (READ_ONCE(exp_mode) == 2 && n < 1 && !list_empty(&zone->exp_pages[mt])) {
+		struct page *page = list_first_entry(&zone->exp_pages[mt], struct page, pcp_list);
+		list_move_tail(&page->pcp_list, dst);
+		zone->exp_count--;
+		n++;
+	}
+	zone->exp_taken += n;
+	if (!n)
+		zone->exp_misses++;
+	spin_unlock_irqrestore(&zone->exp_lock, flags);
+	return n;
+}
+
+static void exp_drain_cache(void)
+{
+	struct zone *zone;
+	for_each_populated_zone(zone) {
+		int mt;
+		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
+			for (;;) {
+				struct page *page;
+				unsigned long flags;
+				spin_lock_irqsave(&zone->exp_lock, flags);
+				if (list_empty(&zone->exp_pages[mt])) {
+					spin_unlock_irqrestore(&zone->exp_lock, flags);
+					break;
+				}
+				page = list_first_entry(&zone->exp_pages[mt], struct page, pcp_list);
+				list_del(&page->pcp_list);
+				zone->exp_count--;
+				zone->exp_drained++;
+				spin_unlock_irqrestore(&zone->exp_lock, flags);
+				flags = exp_zone_lock(zone);
+				__free_one_page(page, page_to_pfn(page), zone, 0,
+					get_pageblock_migratetype(page), FPI_NONE);
+				exp_zone_unlock(zone, flags);
+			}
+		}
+	}
+}
+
+static int exp_sysctl(const struct ctl_table *table, int write, void *buffer,
+		     size_t *lenp, loff_t *ppos)
+{
+	int ret, old_mode;
+	mutex_lock(&exp_config_lock);
+	old_mode = READ_ONCE(exp_mode);
+	if (write) {
+		WRITE_ONCE(exp_mode, 0);
+		exp_drain_cache();
+	}
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (write && (ret || table->data != &exp_mode))
+		WRITE_ONCE(exp_mode, old_mode);
+	mutex_unlock(&exp_config_lock);
+	return ret;
+}
+
+static int exp_show(struct seq_file *m, void *v)
+{
+	struct zone *zone;
+	seq_printf(m, "mode=%d batch=%d cache_kb=%d rx_cpu=%d metadata_bytes_per_zone=%zu\n",
+		exp_mode, exp_batch, exp_cache_kb, exp_rx_cpu,
+		offsetof(struct zone, exp_drained) + sizeof(zone->exp_drained) - offsetof(struct zone, exp_lock));
+	for_each_populated_zone(zone) {
+		unsigned long flags;
+		spin_lock_irqsave(&zone->exp_lock, flags);
+		seq_printf(m, "node=%d zone=%s count=%u peak=%u deposited=%lu taken=%lu misses=%lu drained=%lu lc_admissions=%ld be_fallbacks=%ld\n",
+			zone_to_nid(zone), zone->name, zone->exp_count, zone->exp_peak,
+			zone->exp_deposited, zone->exp_taken, zone->exp_misses,
+			zone->exp_drained, atomic_long_read(&zone->exp_lc_admissions),
+			atomic_long_read(&zone->exp_be_fallbacks));
+		spin_unlock_irqrestore(&zone->exp_lock, flags);
+	}
+	return 0;
+}
+static int __init exp_proc_init(void)
+{
+	return proc_create_single("lc_allocator_exp", 0444, NULL, exp_show) ? 0 : -ENOMEM;
+}
+late_initcall(exp_proc_init);
+
 static void free_pcppages_bulk(struct zone *zone, int count,
 					struct per_cpu_pages *pcp,
 					int pindex)
@@ -1315,17 +1498,21 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	unsigned long flags;
 	unsigned int order;
 	struct page *page;
+	int cap = READ_ONCE(exp_batch), budget = cap;
 
 	/*
 	 * Ensure proper count is passed which otherwise would stuck in the
 	 * below while (list_empty(list)) loop.
 	 */
 	count = min(pcp->count, count);
+	exp_capture_pcp(zone, pcp, &count);
+	if (!count)
+		return;
 
 	/* Ensure requested pindex is drained first. */
 	pindex = pindex - 1;
 
-	spin_lock_irqsave(&zone->lock, flags);
+	flags = exp_zone_lock(zone);
 
 	while (count > 0) {
 		struct list_head *list;
@@ -1355,10 +1542,15 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 
 			__free_one_page(page, pfn, zone, order, mt, FPI_NONE);
 			trace_mm_page_pcpu_drain(page, order, mt);
+			if (cap && (budget -= nr_pages) <= 0 && count > 0) {
+				exp_zone_unlock(zone, flags);
+				flags = exp_zone_lock(zone);
+				budget = cap;
+			}
 		} while (count > 0 && !list_empty(list));
 	}
 
-	spin_unlock_irqrestore(&zone->lock, flags);
+	exp_zone_unlock(zone, flags);
 }
 
 /* Split a multi-block free page into its individual pageblocks. */
@@ -1407,7 +1599,7 @@ static void free_one_page(struct zone *zone, struct page *page,
 			return;
 		}
 	} else {
-		spin_lock_irqsave(&zone->lock, flags);
+		flags = exp_zone_lock(zone);
 	}
 
 	/* The lock succeeded. Process deferred pages. */
@@ -1425,7 +1617,7 @@ static void free_one_page(struct zone *zone, struct page *page,
 		}
 	}
 	split_large_buddy(zone, page, pfn, order, fpi_flags);
-	spin_unlock_irqrestore(&zone->lock, flags);
+	exp_zone_unlock(zone, flags);
 
 	__count_vm_events(PGFREE, 1 << order);
 }
@@ -2380,13 +2572,19 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 {
 	enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
 	unsigned long flags;
-	int i;
+	int i, cap = READ_ONCE(exp_batch);
+
+	if (cap)
+		count = min(count, (unsigned long)max(1, cap >> order));
+	i = exp_take(zone, order, migratetype, count, list);
+	if (i)
+		return i;
 
 	if (unlikely(alloc_flags & ALLOC_TRYLOCK)) {
 		if (!spin_trylock_irqsave(&zone->lock, flags))
 			return 0;
 	} else {
-		spin_lock_irqsave(&zone->lock, flags);
+		flags = exp_zone_lock(zone);
 	}
 	for (i = 0; i < count; ++i) {
 		struct page *page = __rmqueue(zone, order, migratetype,
@@ -2406,7 +2604,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 		 */
 		list_add_tail(&page->pcp_list, list);
 	}
-	spin_unlock_irqrestore(&zone->lock, flags);
+	exp_zone_unlock(zone, flags);
 
 	return i;
 }
@@ -3010,7 +3208,7 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
 			if (!spin_trylock_irqsave(&zone->lock, flags))
 				return NULL;
 		} else {
-			spin_lock_irqsave(&zone->lock, flags);
+			flags = exp_zone_lock(zone);
 		}
 		if (alloc_flags & ALLOC_HIGHATOMIC)
 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
@@ -3029,11 +3227,11 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
 				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
 
 			if (!page) {
-				spin_unlock_irqrestore(&zone->lock, flags);
+				exp_zone_unlock(zone, flags);
 				return NULL;
 			}
 		}
-		spin_unlock_irqrestore(&zone->lock, flags);
+		exp_zone_unlock(zone, flags);
 	} while (check_new_pages(page, order));
 
 	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
@@ -6749,6 +6947,11 @@ out:
 }
 
 static const struct ctl_table page_alloc_sysctl_table[] = {
+	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
+	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
+	{ .procname = "lc_exp_cache_kb", .data = &exp_cache_kb, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_cache_max },
+	{ .procname = "lc_exp_rx_cpu", .data = &exp_rx_cpu, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = &exp_minus_one, .extra2 = SYSCTL_INT_MAX },
+
 	{
 		.procname	= "lc_alloc_diag",
 		.data		= &sysctl_lc_alloc_diag,
