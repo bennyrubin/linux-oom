@@ -48,6 +48,8 @@
 #include <linux/mmu_notifier.h>
 #include <linux/cred.h>
 #include <linux/nmi.h>
+#include <linux/bpf_oom.h>
+#include <linux/btf.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -259,6 +261,15 @@ static const char * const oom_constraint_text[] = {
 	[CONSTRAINT_MEMCG] = "CONSTRAINT_MEMCG",
 };
 
+static const char *oom_handler_name(struct oom_control *oc)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	if (oc->bpf_handler_name)
+		return oc->bpf_handler_name;
+#endif
+	return NULL;
+}
+
 /*
  * Determine the type of allocation constraint.
  */
@@ -466,6 +477,16 @@ static void dump_oom_victim(struct oom_control *oc, struct task_struct *victim)
 
 static void dump_header(struct oom_control *oc)
 {
+	/*
+	 * The rest of the upstream OOM report stays suppressed here (see
+	 * "mm: suppress OOM trace_printk logging") because dump_stack() +
+	 * __show_mem() inside oom_lock perturbs the latency measurements
+	 * this tree exists to take. The BPF handler name is cheap and is
+	 * the only way to tell which policy made the decision, so it is
+	 * emitted unconditionally.
+	 */
+	if (oom_handler_name(oc))
+		pr_warn("oom bpf handler: %s\n", oom_handler_name(oc));
 }
 
 /*
@@ -1262,6 +1283,13 @@ bool out_of_memory(struct oom_control *oc)
 		return true;
 	}
 
+	/*
+	 * Let bpf handle the OOM first. If it was able to free up some memory,
+	 * bail out. Otherwise fall back to the kernel OOM killer.
+	 */
+	if (bpf_handle_oom(oc))
+		return true;
+
 	select_bad_process(oc);
 	/* Found nothing?!?! */
 	if (!oc->chosen) {
@@ -1364,3 +1392,96 @@ put_task:
 	return -ENOSYS;
 #endif /* CONFIG_MMU */
 }
+
+#ifdef CONFIG_BPF_SYSCALL
+
+__bpf_kfunc_start_defs();
+/**
+ * bpf_oom_kill_process - Kill a process as OOM killer
+ * @oc: pointer to oom_control structure, describes OOM context
+ * @task: task to be killed
+ * @message__str: message to print in dmesg
+ *
+ * Kill a process in a way similar to the kernel OOM killer.
+ * This means dump the necessary information to dmesg, adjust memcg
+ * statistics, leverage the oom reaper, respect memory.oom.group etc.
+ *
+ * bpf_oom_kill_process() marks the forward progress by setting
+ * oc->bpf_memory_freed. If the progress was made, the bpf program
+ * is free to decide if the kernel oom killer should be invoked.
+ * Otherwise it's enforced, so that a bad bpf program can't
+ * deadlock the machine on memory.
+ */
+__bpf_kfunc int bpf_oom_kill_process(struct oom_control *oc,
+				     struct task_struct *task,
+				     const char *message__str)
+{
+	if (oom_unkillable_task(task))
+		return -EPERM;
+
+	if (task->signal->oom_score_adj == OOM_SCORE_ADJ_MIN)
+		return -EINVAL;
+
+	/* paired with put_task_struct() in oom_kill_process() */
+	get_task_struct(task);
+
+	oc->chosen = task;
+
+	oom_kill_process(oc, message__str);
+
+	oc->chosen = NULL;
+	oc->bpf_memory_freed = true;
+
+	return 0;
+}
+
+/**
+ * bpf_task_is_oom_victim - Check if the task has been marked as an OOM victim
+ * @task: task to check
+ *
+ * Returns true if the task has been previously selected by the OOM killer
+ * to be killed. It's expected that the task will be destroyed soon and some
+ * memory will be freed, so maybe no additional actions required.
+ */
+__bpf_kfunc bool bpf_task_is_oom_victim(struct task_struct *task)
+{
+	return tsk_is_oom_victim(task);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(bpf_oom_kfuncs)
+BTF_ID_FLAGS(func, bpf_oom_kill_process, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_task_is_oom_victim)
+BTF_KFUNCS_END(bpf_oom_kfuncs)
+
+BTF_ID_LIST_SINGLE(bpf_oom_ops_ids, struct, bpf_oom_ops)
+
+static int bpf_oom_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS ||
+	    prog->aux->attach_btf_id != bpf_oom_ops_ids[0])
+		return -EACCES;
+	return 0;
+}
+
+static const struct btf_kfunc_id_set bpf_oom_kfunc_set = {
+	.owner          = THIS_MODULE,
+	.set            = &bpf_oom_kfuncs,
+	.filter         = bpf_oom_kfunc_filter,
+};
+
+static int __init bpf_oom_init(void)
+{
+	int err;
+
+	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
+					&bpf_oom_kfunc_set);
+	if (err)
+		pr_warn("error while registering bpf oom kfuncs: %d", err);
+
+	return err;
+}
+late_initcall(bpf_oom_init);
+
+#endif

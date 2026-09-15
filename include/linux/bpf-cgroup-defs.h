@@ -70,6 +70,12 @@ struct cgroup_bpf {
 	/* temp storage for effective prog array used by prog_attach/detach */
 	struct bpf_prog_array *inactive;
 
+	/* list of bpf struct ops links */
+	struct list_head struct_ops_links;
+
+	/* BPF OOM struct ops link */
+	struct bpf_struct_ops_link __rcu *bpf_oom_link;
+
 	/* reference counter used to detach bpf programs after cgroup removal */
 	struct percpu_ref refcnt;
 
