@@ -1510,9 +1510,13 @@ __bpf_kfunc bool bpf_task_is_oom_victim(struct task_struct *task)
  * no progress and out_of_memory() runs the full task walk. This records the
  * same "memory is on its way" outcome.
  */
-__bpf_kfunc int bpf_oom_victim_pending(struct oom_control *oc)
+__bpf_kfunc int bpf_oom_victim_pending(struct oom_control *oc,
+				       struct task_struct *task)
 {
 	oc->bpf_memory_freed = true;
+	/* Park the LC state machine on the dying mm, as a fresh kill would. */
+	if (task->signal->oom_mm)
+		oom_control_track_mm(oc, task->signal->oom_mm);
 	return 0;
 }
 
@@ -1521,7 +1525,7 @@ __bpf_kfunc_end_defs();
 BTF_KFUNCS_START(bpf_oom_kfuncs)
 BTF_ID_FLAGS(func, bpf_oom_kill_process, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_task_is_oom_victim)
-BTF_ID_FLAGS(func, bpf_oom_victim_pending)
+BTF_ID_FLAGS(func, bpf_oom_victim_pending, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(bpf_oom_kfuncs)
 
 BTF_ID_LIST_SINGLE(bpf_oom_ops_ids, struct, bpf_oom_ops)

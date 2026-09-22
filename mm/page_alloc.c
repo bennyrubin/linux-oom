@@ -5244,7 +5244,22 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	if (old_mm)
 		mmdrop(old_mm);
 
-	mutex_lock(&oom_lock);
+	/*
+	 * Never sleep here: the page in hand is already allocated, the kill is
+	 * a side effect. If a BE's own slow path holds oom_lock it is running
+	 * the killer right now; go back to PENDING and let the next in-band
+	 * allocation look again (by then a victim is usually marked and the
+	 * policy reports it as pending, which parks the state machine on it).
+	 */
+	if (!mutex_trylock(&oom_lock)) {
+		count_vm_event(LC_OOM_COALESCED);
+		oom_alloc_trace_lc("event=lc_reserve_oom_lock_busy pid=%d tgid=%d\n",
+				   current->pid, current->tgid);
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		lc_oom_state = LC_OOM_PENDING;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		return;
+	}
 	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
 		mutex_unlock(&oom_lock);
 		spin_lock_irqsave(&lc_oom_state_lock, flags);
