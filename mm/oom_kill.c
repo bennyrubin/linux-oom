@@ -1084,6 +1084,8 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	mm = victim->mm;
 	mmgrab(mm);
 
+	oom_alloc_trace_if(true, "event=victim_chosen pid=%d tgid=%d victim_tgid=%d\n",
+			   current->pid, current->tgid, victim->tgid);
 	/* Raise event before sending signal: task reaper must see this */
 	count_vm_event(OOM_KILL);
 	/*

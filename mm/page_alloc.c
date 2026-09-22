@@ -5198,6 +5198,28 @@ static bool lc_oom_safe(gfp_t gfp_mask, unsigned int order)
 		!(current->flags & (PF_MEMALLOC | PF_DUMPCORE));
 }
 
+/*
+ * The state machine holds an mm_count reference on the inflight victim's mm
+ * so it can test MMF_OOM_SKIP safely. Dropping the last reference runs
+ * __mmdrop() (pgd, percpu counters, ...), which does not belong in the LC's
+ * page fault: hand it to an unbound worker (kept off isolated CPUs).
+ */
+static LLIST_HEAD(lc_oom_drop_list);
+static void lc_oom_mmdrop_fn(struct work_struct *work)
+{
+	struct llist_node *n = llist_del_all(&lc_oom_drop_list);
+	struct mm_struct *mm, *tmp;
+
+	llist_for_each_entry_safe(mm, tmp, n, lc_oom_drop_node)
+		mmdrop(mm);
+}
+static DECLARE_WORK(lc_oom_mmdrop_work, lc_oom_mmdrop_fn);
+static void lc_oom_mmdrop_async(struct mm_struct *mm)
+{
+	llist_add(&mm->lc_oom_drop_node, &lc_oom_drop_list);
+	queue_work(system_unbound_wq, &lc_oom_mmdrop_work);
+}
+
 static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 				 unsigned int order,
 				 const struct alloc_context *ac)
@@ -5214,6 +5236,8 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	};
 	unsigned long flags;
 
+	oom_alloc_trace_lc("event=lc_reserve_oom_enter pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	if (!lc_oom_safe(gfp_mask, order)) {
 		spin_lock_irqsave(&lc_oom_state_lock, flags);
 		if (lc_oom_state == LC_OOM_IDLE)
@@ -5242,7 +5266,7 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 
 	if (old_mm)
-		mmdrop(old_mm);
+		lc_oom_mmdrop_async(old_mm);
 
 	/*
 	 * Never sleep here: the page in hand is already allocated, the kill is
@@ -5260,6 +5284,8 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 		return;
 	}
+	oom_alloc_trace_lc("event=lc_reserve_oom_locked pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
 		mutex_unlock(&oom_lock);
 		spin_lock_irqsave(&lc_oom_state_lock, flags);

@@ -1115,6 +1115,8 @@ struct mm_struct {
 		bool oom_teardown_expedited;
 		/* MEMCG_OOM_KILL not yet raised for this mm (lc_oom_kill_defer bit 1) */
 		bool oom_kill_event_pending;
+		/* LC reserve state machine: deferred mmdrop of a finished victim */
+		struct llist_node lc_oom_drop_node;
 
 #ifdef CONFIG_AIO
 		spinlock_t			ioctx_lock;
