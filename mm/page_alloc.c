@@ -3108,6 +3108,8 @@ void free_unref_folios(struct folio_batch *folios)
 		     LC_VICTIM_FASTFREE_BYPASS_PCP) &&
 	    folios->nr && tsk_is_oom_victim(current)) {
 		free_folios_to_buddy(folios);
+		/* Callers (folios_put_refs) rely on the batch coming back empty. */
+		folio_batch_reinit(folios);
 		return;
 	}
 
