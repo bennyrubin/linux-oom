@@ -1314,6 +1314,10 @@ __always_inline bool free_pages_prepare(struct page *page,
 /* Isolated-VM research prototype, disabled by default. */
 static int exp_mode;
 static int exp_batch;
+int sysctl_lc_victim_fastfree;
+int sysctl_lc_victim_gather_batches;
+static int lc_victim_fastfree_max = 3;
+static int lc_victim_gather_batches_max = 64;
 static int exp_cache_kb;
 static int exp_rx_cpu = -1;
 static int exp_minus_one = -1;
@@ -3026,6 +3030,49 @@ void free_frozen_pages(struct page *page, unsigned int order)
 /*
  * Free a batch of folios
  */
+/*
+ * OOM-victim fast release: hand prepared folios straight to the buddy
+ * allocator instead of this CPU's per-CPU lists. Pages parked on a PCP are
+ * not in NR_FREE_PAGES, so they satisfy nobody's watermark check (not even
+ * an allocator on this same CPU) until the list overflows pcp->high, which
+ * under exhaustion has shrunk to high_min. A dying task frees millions of
+ * pages that would overflow anyway; freeing them here does the same
+ * zone-lock holds earlier (capped by lc_exp_batch like every other bulk
+ * free) and skips the list insert and remove.
+ */
+static void free_folios_to_buddy(struct folio_batch *folios)
+{
+	struct zone *locked_zone = NULL;
+	unsigned long flags = 0;
+	int cap = READ_ONCE(exp_batch), budget = cap;
+	int i;
+
+	for (i = 0; i < folios->nr; i++) {
+		struct folio *folio = folios->folios[i];
+		struct zone *zone = folio_zone(folio);
+		unsigned long pfn = folio_pfn(folio);
+		unsigned int order = (unsigned long)folio->private;
+
+		folio->private = NULL;
+		if (zone != locked_zone) {
+			if (locked_zone)
+				exp_zone_unlock(locked_zone, flags);
+			flags = exp_zone_lock(zone);
+			locked_zone = zone;
+			budget = cap;
+		}
+		split_large_buddy(zone, &folio->page, pfn, order, FPI_NONE);
+		__count_vm_events(PGFREE, 1 << order);
+		if (cap && (budget -= 1 << order) <= 0 && i + 1 < folios->nr) {
+			exp_zone_unlock(zone, flags);
+			flags = exp_zone_lock(zone);
+			budget = cap;
+		}
+	}
+	if (locked_zone)
+		exp_zone_unlock(locked_zone, flags);
+}
+
 void free_unref_folios(struct folio_batch *folios)
 {
 	unsigned long __maybe_unused UP_flags;
@@ -3056,6 +3103,13 @@ void free_unref_folios(struct folio_batch *folios)
 		j++;
 	}
 	folios->nr = j;
+
+	if (unlikely(READ_ONCE(sysctl_lc_victim_fastfree) &
+		     LC_VICTIM_FASTFREE_BYPASS_PCP) &&
+	    folios->nr && tsk_is_oom_victim(current)) {
+		free_folios_to_buddy(folios);
+		return;
+	}
 
 	for (i = 0; i < folios->nr; i++) {
 		struct folio *folio = folios->folios[i];
@@ -7002,6 +7056,8 @@ out:
 static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
+	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
+	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
 	{ .procname = "lc_exp_cache_kb", .data = &exp_cache_kb, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_cache_max },
 	{ .procname = "lc_exp_rx_cpu", .data = &exp_rx_cpu, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = &exp_minus_one, .extra2 = SYSCTL_INT_MAX },
 

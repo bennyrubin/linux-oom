@@ -26,9 +26,13 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
 	if (tlb->delayed_rmap && tlb->active != &tlb->local)
 		return false;
 
+	if (tlb->batch_limit && tlb->batch_used >= tlb->batch_limit)
+		return false;
+
 	batch = tlb->active;
 	if (batch->next) {
 		tlb->active = batch->next;
+		tlb->batch_used++;
 		return true;
 	}
 
@@ -40,6 +44,7 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
 		return false;
 
 	tlb->batch_count++;
+	tlb->batch_used++;
 	batch->next = NULL;
 	batch->nr   = 0;
 	batch->max  = MAX_GATHER_BATCH;
@@ -171,6 +176,10 @@ static void tlb_batch_pages_flush(struct mmu_gather *tlb)
 				   current->pid, current->tgid, batch);
 	}
 	tlb->active = &tlb->local;
+	tlb->batch_used = 0;
+	if (tlb->batch_limit && tlb->batch_limit < tlb->batch_limit_max)
+		tlb->batch_limit = min(tlb->batch_limit * 2,
+				       tlb->batch_limit_max);
 }
 
 static void tlb_batch_list_free(struct mmu_gather *tlb)
@@ -449,6 +458,9 @@ static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
 	tlb->local.max  = ARRAY_SIZE(tlb->__pages);
 	tlb->active     = &tlb->local;
 	tlb->batch_count = 0;
+	tlb->batch_limit = 0;
+	tlb->batch_limit_max = 0;
+	tlb->batch_used = 0;
 #endif
 	tlb->delayed_rmap = 0;
 

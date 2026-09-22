@@ -54,6 +54,18 @@ static inline bool oom_alloc_trace_current_lc(void)
 				     ktime_get_ns(), ##__VA_ARGS__);	\
 	} while (0)
 
+/*
+ * Expedited OOM-victim teardown knobs (mm/page_alloc.c sysctls):
+ *  bit 0: the victim's freed pages bypass the per-CPU lists and go to the
+ *         buddy allocator under capped zone-lock holds, so they count
+ *         toward the watermarks (and the LC reserve band) at once;
+ *  bit 1: mmu_gather slow start (first flush after one batch page).
+ */
+#define LC_VICTIM_FASTFREE_BYPASS_PCP	1
+#define LC_VICTIM_FASTFREE_SLOWSTART	2
+extern int sysctl_lc_victim_fastfree;
+extern int sysctl_lc_victim_gather_batches;
+
 #define oom_alloc_trace_if(cond, fmt, ...)				\
 	do {								\
 		if (oom_alloc_trace_enabled() && (cond))			\

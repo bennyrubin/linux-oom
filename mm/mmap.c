@@ -1305,6 +1305,29 @@ void exit_mmap(struct mm_struct *mm)
 	 */
 	tlb.oom_teardown_noresched = oom_teardown_expedited &&
 		READ_ONCE(sysctl_oom_teardown_boost_prio) == MAX_RT_PRIO - 1;
+	if (oom_teardown_expedited) {
+		/*
+		 * First release fast: the default gather holds ~9,700 pages
+		 * (~530 us of PTE zapping) before the first flush frees
+		 * anything. Start with one batch page (~509 pages) and let the
+		 * limit double per flush (lc_victim_fastfree bit 1), or pin it
+		 * (lc_victim_gather_batches) to measure the throughput cost.
+		 */
+		unsigned int max = READ_ONCE(sysctl_lc_victim_gather_batches);
+		unsigned int ff = READ_ONCE(sysctl_lc_victim_fastfree);
+
+		if (!max || max > MAX_GATHER_BATCH_COUNT)
+			max = MAX_GATHER_BATCH_COUNT;
+		tlb.batch_limit_max = max;
+		if (ff & LC_VICTIM_FASTFREE_SLOWSTART)
+			tlb.batch_limit = 1;
+		else if (READ_ONCE(sysctl_lc_victim_gather_batches))
+			tlb.batch_limit = max;
+		oom_alloc_trace_if(true,
+				   "event=victim_gather_policy pid=%d tgid=%d fastfree=%u limit=%u max=%u\n",
+				   current->pid, current->tgid, ff,
+				   tlb.batch_limit, tlb.batch_limit_max);
+	}
 	/* update_hiwater_rss(mm) here? but nobody should be looking */
 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
 	unmap_vmas(&tlb, &vmi.mas, vma, 0, ULONG_MAX, ULONG_MAX, false);
