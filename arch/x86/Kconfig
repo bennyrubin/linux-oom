@@ -36,7 +36,7 @@ config X86_64
 	select NEED_DMA_MAP_STATE
 	select SWIOTLB
 	select ARCH_HAS_ELFCORE_COMPAT
-	select ZONE_DMA32
+	# ZONE_DMA32 is not selected here: the prompt decides (single-Normal-zone experiments).
 	select EXECMEM if DYNAMIC_FTRACE
 	select ACPI_MRRM if ACPI
 
