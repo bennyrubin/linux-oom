@@ -15,6 +15,7 @@
  *          (lots of bits borrowed from Ingo Molnar & Andrew Morton)
  */
 
+#include <linux/ktime.h>
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -1330,40 +1331,77 @@ static bool exp_is_lc(void)
 }
 
 /* All caller paths retain irqsave semantics. No sleeping or waiter allocation. */
+/* Samples are CPU-local while the owning path has IRQs disabled. */
+struct ab_zone_sample {
+	struct zone *zone;
+	u64 start_ns, acquired_ns;
+	unsigned long caller;
+};
+static DEFINE_PER_CPU(struct ab_zone_sample, ab_zone_sample);
+
 static noinline unsigned long exp_zone_lock(struct zone *zone)
 {
 	unsigned long flags;
+	u64 start = 0, acquired = 0;
 	int spins;
 
 	local_irq_save(flags);
+	if (trace_mm_ab_zone_lock_enabled())
+		start = ktime_get_ns();
 	if (READ_ONCE(exp_mode) != 1) {
 		spin_lock(&zone->lock);
-		return flags;
+		goto acquired;
 	}
 	if (exp_is_lc()) {
 		atomic_inc_return(&zone->exp_lc_pending);
 		spin_lock(&zone->lock);
+		if (start)
+			acquired = ktime_get_ns();
 		atomic_dec(&zone->exp_lc_pending);
 		atomic_long_inc(&zone->exp_lc_admissions);
-		return flags;
+		goto acquired;
 	}
 	for (spins = 0; spins < 4096; spins++) {
 		if (!atomic_read(&zone->exp_lc_pending) && spin_trylock(&zone->lock)) {
 			if (!atomic_read(&zone->exp_lc_pending))
-				return flags;
+				goto acquired;
 			spin_unlock(&zone->lock);
 		}
 		cpu_relax();
 	}
-	/* Finite deferral: no unbounded BE starvation if an LC vCPU stalls. */
 	atomic_long_inc(&zone->exp_be_fallbacks);
 	spin_lock(&zone->lock);
+acquired:
+	if (start) {
+		struct ab_zone_sample *sample = this_cpu_ptr(&ab_zone_sample);
+
+		if (!acquired)
+			acquired = ktime_get_ns();
+		sample->start_ns = start;
+		sample->acquired_ns = acquired;
+		sample->caller = _RET_IP_;
+		sample->zone = zone;
+	}
 	return flags;
 }
 
 static noinline void exp_zone_unlock(struct zone *zone, unsigned long flags)
 {
-	spin_unlock_irqrestore(&zone->lock, flags);
+	struct ab_zone_sample *sample = this_cpu_ptr(&ab_zone_sample);
+
+	if (unlikely(sample->zone == zone)) {
+		u64 end = ktime_get_ns();
+		struct ab_zone_sample saved = *sample;
+
+		sample->zone = NULL;
+		spin_unlock(&zone->lock);
+		/* Emit after releasing zone->lock, before re-enabling IRQs. */
+		trace_mm_ab_zone_lock((unsigned long)zone, saved.caller,
+				     saved.start_ns, saved.acquired_ns, end);
+		local_irq_restore(flags);
+	} else {
+		spin_unlock_irqrestore(&zone->lock, flags);
+	}
 }
 
 /* Called with PCP locked, but never with zone->lock held. */
@@ -3299,6 +3337,16 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 			struct list_head *list)
 {
 	struct page *page;
+    bool ab_trace = trace_mm_ab_pcp_alloc_enabled();
+    bool ab_empty = false;
+    int ab_before = 0;
+    u64 ab_start = 0;
+
+    if (unlikely(ab_trace)) {
+        ab_before = pcp->count;
+        ab_empty = list_empty(list);
+        ab_start = ktime_get_ns();
+    }
 
 	do {
 		if (list_empty(list)) {
@@ -3311,7 +3359,7 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 
 			pcp->count += alloced << order;
 			if (unlikely(list_empty(list)))
-				return NULL;
+				{ page = NULL; goto ab_out; }
 		}
 
 		page = list_first_entry(list, struct page, pcp_list);
@@ -3319,7 +3367,12 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 		pcp->count -= 1 << order;
 	} while (check_new_pages(page, order));
 
-	return page;
+	ab_out:
+    if (unlikely(ab_trace))
+        trace_mm_ab_pcp_alloc((unsigned long)zone, order, migratetype,
+                             ab_before, pcp->count, ab_empty, page != NULL,
+                             ab_start, ktime_get_ns());
+    return page;
 }
 
 /* Lock and remove page from the per-cpu list */
