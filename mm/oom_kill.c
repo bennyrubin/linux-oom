@@ -485,8 +485,14 @@ static void dump_header(struct oom_control *oc)
 	 * the only way to tell which policy made the decision, so it is
 	 * emitted unconditionally.
 	 */
+	/*
+	 * Even that line costs 7-37 us of printk machinery inside the LC's
+	 * page fault when the BPF handler runs there (measured 2026-09-22).
+	 * Keep it on the existing trace_printk gate instead of the console.
+	 */
 	if (oom_handler_name(oc))
-		pr_warn("oom bpf handler: %s\n", oom_handler_name(oc));
+		oom_alloc_trace_if(true, "event=bpf_oom_handler name=%s\n",
+				   oom_handler_name(oc));
 }
 
 /*
@@ -1091,6 +1097,20 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	 * That thread will now get access to memory reserves since it has a
 	 * pending fatal signal.
 	 */
+	/*
+	 * The SIGKILL above already reaches every thread of the victim's
+	 * thread group, so this walk only matters when some OTHER thread
+	 * group shares the mm (CLONE_VM without CLONE_THREAD, a vfork
+	 * window, kthread_use_mm()). mm_users counts every task holding
+	 * the mm plus any transient mmget() holder; when it equals the
+	 * victim's own thread count nothing else can be sharing it, and
+	 * the O(#tasks) walk (44-54 us on a 190-task guest) is skipped.
+	 * The check is O(1) in the thread count. Any transient extra
+	 * reference at this instant makes the counts differ and we simply
+	 * fall back to the full walk, so this only ever removes work.
+	 */
+	if (atomic_read(&mm->mm_users) == get_nr_threads(victim))
+		goto skip_shared_mm;
 	rcu_read_lock();
 	for_each_process(p) {
 		if (!process_shares_mm(p, mm))
@@ -1111,6 +1131,7 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 		do_send_sig_info(SIGKILL, SEND_SIG_PRIV, p, PIDTYPE_TGID);
 	}
 	rcu_read_unlock();
+skip_shared_mm:
 
 	if (can_oom_reap)
 		queue_oom_reaper(victim);
