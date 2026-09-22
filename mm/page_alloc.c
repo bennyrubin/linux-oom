@@ -1316,6 +1316,8 @@ static int exp_mode;
 static int exp_batch;
 int sysctl_lc_victim_fastfree;
 int sysctl_lc_victim_gather_batches;
+int sysctl_lc_oom_kill_defer;
+static int lc_oom_kill_defer_max = 3;
 static int lc_victim_fastfree_max = 3;
 static int lc_victim_gather_batches_max = 64;
 static int exp_cache_kb;
@@ -5256,8 +5258,12 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 			   current->pid, current->tgid, order,
 			   (__force unsigned int)gfp_mask);
 	out_of_memory(&oc);
+	oom_alloc_trace_lc("event=lc_reserve_oom_killer_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	mutex_unlock(&oom_lock);
 	oom_boost_deferred_victim(&oc);
+	oom_alloc_trace_lc("event=lc_reserve_oom_boost_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 
 	spin_lock_irqsave(&lc_oom_state_lock, flags);
 	lc_oom_inflight_mm = oc.inflight_mm;
@@ -7060,6 +7066,7 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
 	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
 	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
+	{ .procname = "lc_oom_kill_defer", .data = &sysctl_lc_oom_kill_defer, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_oom_kill_defer_max },
 	{ .procname = "lc_exp_cache_kb", .data = &exp_cache_kb, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_cache_max },
 	{ .procname = "lc_exp_rx_cpu", .data = &exp_rx_cpu, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = &exp_minus_one, .extra2 = SYSCTL_INT_MAX },
 

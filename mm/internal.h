@@ -65,6 +65,14 @@ static inline bool oom_alloc_trace_current_lc(void)
 #define LC_VICTIM_FASTFREE_SLOWSTART	2
 extern int sysctl_lc_victim_fastfree;
 extern int sysctl_lc_victim_gather_batches;
+/*
+ * Work moved off the killer's (the LC's) fault onto the victim's own exit:
+ *  bit 0: skip the inline RT boost of the victim (exit_mmap boosts itself);
+ *  bit 1: raise the memcg MEMCG_OOM_KILL event from the victim's exit_mmap.
+ */
+#define LC_OOM_KILL_DEFER_BOOST		1
+#define LC_OOM_KILL_DEFER_MEMCG_EVENT	2
+extern int sysctl_lc_oom_kill_defer;
 
 #define oom_alloc_trace_if(cond, fmt, ...)				\
 	do {								\

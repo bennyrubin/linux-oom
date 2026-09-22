@@ -1113,6 +1113,8 @@ struct mm_struct {
 		 * victim, so keep the expedited teardown state on the mm.
 		 */
 		bool oom_teardown_expedited;
+		/* MEMCG_OOM_KILL not yet raised for this mm (lc_oom_kill_defer bit 1) */
+		bool oom_kill_event_pending;
 
 #ifdef CONFIG_AIO
 		spinlock_t			ioctx_lock;

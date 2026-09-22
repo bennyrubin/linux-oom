@@ -913,6 +913,17 @@ void oom_boost_deferred_victim(struct oom_control *oc)
 	if (!oc->boosted)
 		return;
 
+	/*
+	 * The boost is sched_setscheduler() on a task running on another CPU:
+	 * rq lock plus a resched IPI, paid by the killer. exit_mmap() boosts
+	 * the victim itself as soon as it gets there (oom_teardown_expedited),
+	 * so the inline boost only matters when the victim is not running.
+	 */
+	if (READ_ONCE(sysctl_lc_oom_kill_defer) & LC_OOM_KILL_DEFER_BOOST) {
+		put_task_struct(oc->boosted);
+		oc->boosted = NULL;
+		return;
+	}
 	boost_oom_victim(oc->boosted);
 	put_task_struct(oc->boosted);
 	oc->boosted = NULL;
@@ -1075,7 +1086,15 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 
 	/* Raise event before sending signal: task reaper must see this */
 	count_vm_event(OOM_KILL);
-	memcg_memory_event_mm(mm, MEMCG_OOM_KILL);
+	/*
+	 * memcg_memory_event_mm() walks the memcg ancestry and calls
+	 * cgroup_file_notify() (kernfs lock + work wake) at every level, inside
+	 * the killer's fault. Optionally hand it to the victim's exit_mmap().
+	 */
+	if (READ_ONCE(sysctl_lc_oom_kill_defer) & LC_OOM_KILL_DEFER_MEMCG_EVENT)
+		WRITE_ONCE(mm->oom_kill_event_pending, true);
+	else
+		memcg_memory_event_mm(mm, MEMCG_OOM_KILL);
 
 	/*
 	 * We should send SIGKILL before granting access to memory reserves
@@ -1083,6 +1102,8 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	 * reserves from the user space under its control.
 	 */
 	do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID);
+	oom_alloc_trace_if(true, "event=victim_signalled pid=%d tgid=%d victim_tgid=%d\n",
+			   current->pid, current->tgid, victim->tgid);
 	mark_oom_victim(victim);
 	oom_control_track_mm(oc, mm);
 	task_unlock(victim);
@@ -1135,6 +1156,8 @@ skip_shared_mm:
 
 	if (can_oom_reap)
 		queue_oom_reaper(victim);
+	oom_alloc_trace_if(true, "event=victim_reaper_queued pid=%d tgid=%d victim_tgid=%d\n",
+			   current->pid, current->tgid, victim->tgid);
 
 	mmdrop(mm);
 	put_task_struct(victim);
@@ -1308,8 +1331,15 @@ bool out_of_memory(struct oom_control *oc)
 	 * Let bpf handle the OOM first. If it was able to free up some memory,
 	 * bail out. Otherwise fall back to the kernel OOM killer.
 	 */
-	if (bpf_handle_oom(oc))
+	oom_alloc_trace_if(true, "event=oom_bpf_enter pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
+	if (bpf_handle_oom(oc)) {
+		oom_alloc_trace_if(true, "event=oom_bpf_done pid=%d tgid=%d handled=1\n",
+				   current->pid, current->tgid);
 		return true;
+	}
+	oom_alloc_trace_if(true, "event=oom_bpf_done pid=%d tgid=%d handled=0\n",
+			   current->pid, current->tgid);
 
 	select_bad_process(oc);
 	/* Found nothing?!?! */
@@ -1469,11 +1499,29 @@ __bpf_kfunc bool bpf_task_is_oom_victim(struct task_struct *task)
 	return tsk_is_oom_victim(task);
 }
 
+/**
+ * bpf_oom_victim_pending - report that a chosen victim is already dying
+ * @oc: OOM context
+ *
+ * The in-kernel killer treats an already-dying victim as progress (see
+ * oom_evaluate_task(): abort, out_of_memory() returns true and the allocator
+ * retries). A BPF policy that finds its best candidate already marked has no
+ * way to say the same: returning without a kill makes bpf_handle_oom() report
+ * no progress and out_of_memory() runs the full task walk. This records the
+ * same "memory is on its way" outcome.
+ */
+__bpf_kfunc int bpf_oom_victim_pending(struct oom_control *oc)
+{
+	oc->bpf_memory_freed = true;
+	return 0;
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(bpf_oom_kfuncs)
 BTF_ID_FLAGS(func, bpf_oom_kill_process, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_task_is_oom_victim)
+BTF_ID_FLAGS(func, bpf_oom_victim_pending)
 BTF_KFUNCS_END(bpf_oom_kfuncs)
 
 BTF_ID_LIST_SINGLE(bpf_oom_ops_ids, struct, bpf_oom_ops)

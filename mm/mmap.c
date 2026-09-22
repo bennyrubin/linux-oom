@@ -45,6 +45,7 @@
 #include <linux/moduleparam.h>
 #include <linux/pkeys.h>
 #include <linux/oom.h>
+#include <linux/memcontrol.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/rt.h>
 #include <linux/ksm.h>
@@ -1280,6 +1281,10 @@ void exit_mmap(struct mm_struct *mm)
 	oom_alloc_trace_if(oom_teardown_expedited,
 			   "event=victim_exit_mmap_enter pid=%d tgid=%d mm=%px boosted=%d\n",
 			   current->pid, current->tgid, mm, rt_task(current));
+	if (READ_ONCE(mm->oom_kill_event_pending)) {
+		WRITE_ONCE(mm->oom_kill_event_pending, false);
+		memcg_memory_event_mm(mm, MEMCG_OOM_KILL);
+	}
 
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
