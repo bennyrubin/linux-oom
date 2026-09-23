@@ -54,6 +54,26 @@ static inline bool oom_alloc_trace_current_lc(void)
 				     ktime_get_ns(), ##__VA_ARGS__);	\
 	} while (0)
 
+/*
+ * Expedited OOM-victim teardown knobs (mm/page_alloc.c sysctls):
+ *  bit 0: the victim's freed pages bypass the per-CPU lists and go to the
+ *         buddy allocator under capped zone-lock holds, so they count
+ *         toward the watermarks (and the LC reserve band) at once;
+ *  bit 1: mmu_gather slow start (first flush after one batch page).
+ */
+#define LC_VICTIM_FASTFREE_BYPASS_PCP	1
+#define LC_VICTIM_FASTFREE_SLOWSTART	2
+extern int sysctl_lc_victim_fastfree;
+extern int sysctl_lc_victim_gather_batches;
+/*
+ * Work moved off the killer's (the LC's) fault onto the victim's own exit:
+ *  bit 0: skip the inline RT boost of the victim (exit_mmap boosts itself);
+ *  bit 1: raise the memcg MEMCG_OOM_KILL event from the victim's exit_mmap.
+ */
+#define LC_OOM_KILL_DEFER_BOOST		1
+#define LC_OOM_KILL_DEFER_MEMCG_EVENT	2
+extern int sysctl_lc_oom_kill_defer;
+
 #define oom_alloc_trace_if(cond, fmt, ...)				\
 	do {								\
 		if (oom_alloc_trace_enabled() && (cond))			\

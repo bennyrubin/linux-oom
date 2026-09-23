@@ -524,6 +524,67 @@ TRACE_EVENT(rss_stat,
 		__print_symbolic(__entry->member, TRACE_MM_PAGES),
 		__entry->size)
 	);
+
+/* Optional allocator-microbenchmark diagnostics. Disabled static key by default.
+ * Counts describe the whole PCP; empty describes the requested order/type list.
+ * Caller holds the PCP lock across this interval. */
+TRACE_EVENT(mm_ab_pcp_alloc,
+    TP_PROTO(unsigned long zone, unsigned int order, int migratetype,
+             int before, int after, bool empty, bool success, u64 start_ns, u64 end_ns),
+    TP_ARGS(zone, order, migratetype, before, after, empty, success, start_ns, end_ns),
+    TP_STRUCT__entry(
+        __field(unsigned long, zone)
+        __field(unsigned int, order)
+        __field(int, migratetype)
+        __field(int, before)
+        __field(int, after)
+        __field(bool, empty)
+        __field(bool, success)
+        __field(u64, start_ns)
+        __field(u64, end_ns)
+    ),
+    TP_fast_assign(
+        __entry->zone = zone;
+        __entry->order = order;
+        __entry->migratetype = migratetype;
+        __entry->before = before;
+        __entry->after = after;
+        __entry->empty = empty;
+        __entry->success = success;
+        __entry->start_ns = start_ns;
+        __entry->end_ns = end_ns;
+    ),
+    TP_printk("zone=%lx order=%u mt=%d before=%d after=%d empty=%d success=%d start=%llu end=%llu",
+        __entry->zone, __entry->order, __entry->migratetype,
+        __entry->before, __entry->after, __entry->empty, __entry->success,
+        __entry->start_ns, __entry->end_ns)
+);
+
+
+/* Admission includes policy deferral; timestamps are wall time, not CPU time. */
+TRACE_EVENT(mm_ab_zone_lock,
+	TP_PROTO(unsigned long zone, unsigned long caller, u64 start_ns,
+		 u64 acquired_ns, u64 release_ns),
+	TP_ARGS(zone, caller, start_ns, acquired_ns, release_ns),
+	TP_STRUCT__entry(
+		__field(unsigned long, zone)
+		__field(unsigned long, caller)
+		__field(u64, start_ns)
+		__field(u64, acquired_ns)
+		__field(u64, release_ns)
+	),
+	TP_fast_assign(
+		__entry->zone = zone;
+		__entry->caller = caller;
+		__entry->start_ns = start_ns;
+		__entry->acquired_ns = acquired_ns;
+		__entry->release_ns = release_ns;
+	),
+	TP_printk("zone=%lx caller=%lx start=%llu acquired=%llu release=%llu",
+		__entry->zone, __entry->caller, __entry->start_ns,
+		__entry->acquired_ns, __entry->release_ns)
+);
+
 #endif /* _TRACE_KMEM_H */
 
 /* This part must be outside protection */

@@ -15,6 +15,7 @@
  *          (lots of bits borrowed from Ingo Molnar & Andrew Morton)
  */
 
+#include <linux/ktime.h>
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -1313,6 +1314,12 @@ __always_inline bool free_pages_prepare(struct page *page,
 /* Isolated-VM research prototype, disabled by default. */
 static int exp_mode;
 static int exp_batch;
+int sysctl_lc_victim_fastfree;
+int sysctl_lc_victim_gather_batches;
+int sysctl_lc_oom_kill_defer;
+static int lc_oom_kill_defer_max = 3;
+static int lc_victim_fastfree_max = 3;
+static int lc_victim_gather_batches_max = 64;
 static int exp_cache_kb;
 static int exp_rx_cpu = -1;
 static int exp_minus_one = -1;
@@ -1330,40 +1337,77 @@ static bool exp_is_lc(void)
 }
 
 /* All caller paths retain irqsave semantics. No sleeping or waiter allocation. */
+/* Samples are CPU-local while the owning path has IRQs disabled. */
+struct ab_zone_sample {
+	struct zone *zone;
+	u64 start_ns, acquired_ns;
+	unsigned long caller;
+};
+static DEFINE_PER_CPU(struct ab_zone_sample, ab_zone_sample);
+
 static noinline unsigned long exp_zone_lock(struct zone *zone)
 {
 	unsigned long flags;
+	u64 start = 0, acquired = 0;
 	int spins;
 
 	local_irq_save(flags);
+	if (trace_mm_ab_zone_lock_enabled())
+		start = ktime_get_ns();
 	if (READ_ONCE(exp_mode) != 1) {
 		spin_lock(&zone->lock);
-		return flags;
+		goto acquired;
 	}
 	if (exp_is_lc()) {
 		atomic_inc_return(&zone->exp_lc_pending);
 		spin_lock(&zone->lock);
+		if (start)
+			acquired = ktime_get_ns();
 		atomic_dec(&zone->exp_lc_pending);
 		atomic_long_inc(&zone->exp_lc_admissions);
-		return flags;
+		goto acquired;
 	}
 	for (spins = 0; spins < 4096; spins++) {
 		if (!atomic_read(&zone->exp_lc_pending) && spin_trylock(&zone->lock)) {
 			if (!atomic_read(&zone->exp_lc_pending))
-				return flags;
+				goto acquired;
 			spin_unlock(&zone->lock);
 		}
 		cpu_relax();
 	}
-	/* Finite deferral: no unbounded BE starvation if an LC vCPU stalls. */
 	atomic_long_inc(&zone->exp_be_fallbacks);
 	spin_lock(&zone->lock);
+acquired:
+	if (start) {
+		struct ab_zone_sample *sample = this_cpu_ptr(&ab_zone_sample);
+
+		if (!acquired)
+			acquired = ktime_get_ns();
+		sample->start_ns = start;
+		sample->acquired_ns = acquired;
+		sample->caller = _RET_IP_;
+		sample->zone = zone;
+	}
 	return flags;
 }
 
 static noinline void exp_zone_unlock(struct zone *zone, unsigned long flags)
 {
-	spin_unlock_irqrestore(&zone->lock, flags);
+	struct ab_zone_sample *sample = this_cpu_ptr(&ab_zone_sample);
+
+	if (unlikely(sample->zone == zone)) {
+		u64 end = ktime_get_ns();
+		struct ab_zone_sample saved = *sample;
+
+		sample->zone = NULL;
+		spin_unlock(&zone->lock);
+		/* Emit after releasing zone->lock, before re-enabling IRQs. */
+		trace_mm_ab_zone_lock((unsigned long)zone, saved.caller,
+				     saved.start_ns, saved.acquired_ns, end);
+		local_irq_restore(flags);
+	} else {
+		spin_unlock_irqrestore(&zone->lock, flags);
+	}
 }
 
 /* Called with PCP locked, but never with zone->lock held. */
@@ -2988,6 +3032,49 @@ void free_frozen_pages(struct page *page, unsigned int order)
 /*
  * Free a batch of folios
  */
+/*
+ * OOM-victim fast release: hand prepared folios straight to the buddy
+ * allocator instead of this CPU's per-CPU lists. Pages parked on a PCP are
+ * not in NR_FREE_PAGES, so they satisfy nobody's watermark check (not even
+ * an allocator on this same CPU) until the list overflows pcp->high, which
+ * under exhaustion has shrunk to high_min. A dying task frees millions of
+ * pages that would overflow anyway; freeing them here does the same
+ * zone-lock holds earlier (capped by lc_exp_batch like every other bulk
+ * free) and skips the list insert and remove.
+ */
+static void free_folios_to_buddy(struct folio_batch *folios)
+{
+	struct zone *locked_zone = NULL;
+	unsigned long flags = 0;
+	int cap = READ_ONCE(exp_batch), budget = cap;
+	int i;
+
+	for (i = 0; i < folios->nr; i++) {
+		struct folio *folio = folios->folios[i];
+		struct zone *zone = folio_zone(folio);
+		unsigned long pfn = folio_pfn(folio);
+		unsigned int order = (unsigned long)folio->private;
+
+		folio->private = NULL;
+		if (zone != locked_zone) {
+			if (locked_zone)
+				exp_zone_unlock(locked_zone, flags);
+			flags = exp_zone_lock(zone);
+			locked_zone = zone;
+			budget = cap;
+		}
+		split_large_buddy(zone, &folio->page, pfn, order, FPI_NONE);
+		__count_vm_events(PGFREE, 1 << order);
+		if (cap && (budget -= 1 << order) <= 0 && i + 1 < folios->nr) {
+			exp_zone_unlock(zone, flags);
+			flags = exp_zone_lock(zone);
+			budget = cap;
+		}
+	}
+	if (locked_zone)
+		exp_zone_unlock(locked_zone, flags);
+}
+
 void free_unref_folios(struct folio_batch *folios)
 {
 	unsigned long __maybe_unused UP_flags;
@@ -3018,6 +3105,15 @@ void free_unref_folios(struct folio_batch *folios)
 		j++;
 	}
 	folios->nr = j;
+
+	if (unlikely(READ_ONCE(sysctl_lc_victim_fastfree) &
+		     LC_VICTIM_FASTFREE_BYPASS_PCP) &&
+	    folios->nr && tsk_is_oom_victim(current)) {
+		free_folios_to_buddy(folios);
+		/* Callers (folios_put_refs) rely on the batch coming back empty. */
+		folio_batch_reinit(folios);
+		return;
+	}
 
 	for (i = 0; i < folios->nr; i++) {
 		struct folio *folio = folios->folios[i];
@@ -3299,6 +3395,16 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 			struct list_head *list)
 {
 	struct page *page;
+    bool ab_trace = trace_mm_ab_pcp_alloc_enabled();
+    bool ab_empty = false;
+    int ab_before = 0;
+    u64 ab_start = 0;
+
+    if (unlikely(ab_trace)) {
+        ab_before = pcp->count;
+        ab_empty = list_empty(list);
+        ab_start = ktime_get_ns();
+    }
 
 	do {
 		if (list_empty(list)) {
@@ -3311,7 +3417,7 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 
 			pcp->count += alloced << order;
 			if (unlikely(list_empty(list)))
-				return NULL;
+				{ page = NULL; goto ab_out; }
 		}
 
 		page = list_first_entry(list, struct page, pcp_list);
@@ -3319,7 +3425,12 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 		pcp->count -= 1 << order;
 	} while (check_new_pages(page, order));
 
-	return page;
+	ab_out:
+    if (unlikely(ab_trace))
+        trace_mm_ab_pcp_alloc((unsigned long)zone, order, migratetype,
+                             ab_before, pcp->count, ab_empty, page != NULL,
+                             ab_start, ktime_get_ns());
+    return page;
 }
 
 /* Lock and remove page from the per-cpu list */
@@ -5087,6 +5198,28 @@ static bool lc_oom_safe(gfp_t gfp_mask, unsigned int order)
 		!(current->flags & (PF_MEMALLOC | PF_DUMPCORE));
 }
 
+/*
+ * The state machine holds an mm_count reference on the inflight victim's mm
+ * so it can test MMF_OOM_SKIP safely. Dropping the last reference runs
+ * __mmdrop() (pgd, percpu counters, ...), which does not belong in the LC's
+ * page fault: hand it to an unbound worker (kept off isolated CPUs).
+ */
+static LLIST_HEAD(lc_oom_drop_list);
+static void lc_oom_mmdrop_fn(struct work_struct *work)
+{
+	struct llist_node *n = llist_del_all(&lc_oom_drop_list);
+	struct mm_struct *mm, *tmp;
+
+	llist_for_each_entry_safe(mm, tmp, n, lc_oom_drop_node)
+		mmdrop(mm);
+}
+static DECLARE_WORK(lc_oom_mmdrop_work, lc_oom_mmdrop_fn);
+static void lc_oom_mmdrop_async(struct mm_struct *mm)
+{
+	llist_add(&mm->lc_oom_drop_node, &lc_oom_drop_list);
+	queue_work(system_unbound_wq, &lc_oom_mmdrop_work);
+}
+
 static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 				 unsigned int order,
 				 const struct alloc_context *ac)
@@ -5103,6 +5236,8 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	};
 	unsigned long flags;
 
+	oom_alloc_trace_lc("event=lc_reserve_oom_enter pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	if (!lc_oom_safe(gfp_mask, order)) {
 		spin_lock_irqsave(&lc_oom_state_lock, flags);
 		if (lc_oom_state == LC_OOM_IDLE)
@@ -5131,9 +5266,26 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 
 	if (old_mm)
-		mmdrop(old_mm);
+		lc_oom_mmdrop_async(old_mm);
 
-	mutex_lock(&oom_lock);
+	/*
+	 * Never sleep here: the page in hand is already allocated, the kill is
+	 * a side effect. If a BE's own slow path holds oom_lock it is running
+	 * the killer right now; go back to PENDING and let the next in-band
+	 * allocation look again (by then a victim is usually marked and the
+	 * policy reports it as pending, which parks the state machine on it).
+	 */
+	if (!mutex_trylock(&oom_lock)) {
+		count_vm_event(LC_OOM_COALESCED);
+		oom_alloc_trace_lc("event=lc_reserve_oom_lock_busy pid=%d tgid=%d\n",
+				   current->pid, current->tgid);
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		lc_oom_state = LC_OOM_PENDING;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		return;
+	}
+	oom_alloc_trace_lc("event=lc_reserve_oom_locked pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
 		mutex_unlock(&oom_lock);
 		spin_lock_irqsave(&lc_oom_state_lock, flags);
@@ -5147,8 +5299,12 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 			   current->pid, current->tgid, order,
 			   (__force unsigned int)gfp_mask);
 	out_of_memory(&oc);
+	oom_alloc_trace_lc("event=lc_reserve_oom_killer_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 	mutex_unlock(&oom_lock);
 	oom_boost_deferred_victim(&oc);
+	oom_alloc_trace_lc("event=lc_reserve_oom_boost_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
 
 	spin_lock_irqsave(&lc_oom_state_lock, flags);
 	lc_oom_inflight_mm = oc.inflight_mm;
@@ -6949,6 +7105,9 @@ out:
 static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
+	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
+	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
+	{ .procname = "lc_oom_kill_defer", .data = &sysctl_lc_oom_kill_defer, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_oom_kill_defer_max },
 	{ .procname = "lc_exp_cache_kb", .data = &exp_cache_kb, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_cache_max },
 	{ .procname = "lc_exp_rx_cpu", .data = &exp_rx_cpu, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = &exp_minus_one, .extra2 = SYSCTL_INT_MAX },
 

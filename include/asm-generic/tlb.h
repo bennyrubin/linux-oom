@@ -387,6 +387,15 @@ struct mmu_gather {
 	unsigned int		vma_pfn  : 1;
 
 	unsigned int		batch_count;
+	/*
+	 * Expedited OOM teardown: cap the number of batch pages gathered
+	 * before a flush (0 = MAX_GATHER_BATCH_COUNT), counting reused
+	 * batches too, and let the cap double after every flush up to
+	 * batch_limit_max so only the first flushes are small.
+	 */
+	unsigned int		batch_limit;
+	unsigned int		batch_limit_max;
+	unsigned int		batch_used;
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
 	struct mmu_gather_batch *active;
