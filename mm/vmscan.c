@@ -3828,6 +3828,10 @@ static void walk_mm(struct mm_struct *mm, struct lru_gen_mm_walk *walk)
 
 		err = -EBUSY;
 
+		/* A dying OOM victim does not age other tasks' page tables (vm.lc_victim_bail). */
+		if (oom_victim_should_bail())
+			break;
+
 		/* another thread might have called inc_max_seq() */
 		if (walk->seq != max_seq)
 			break;
@@ -4896,6 +4900,10 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	while (true) {
 		int delta;
 
+		/* MGLRU: a dying OOM victim stops its in-flight round (vm.lc_victim_bail). */
+		if (oom_victim_should_bail())
+			break;
+
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
 		if (nr_to_scan <= 0)
 			break;
@@ -5012,7 +5020,7 @@ restart:
 
 		rcu_read_lock();
 
-		if (should_abort_scan(lruvec, sc))
+		if (oom_victim_should_bail() || should_abort_scan(lruvec, sc))
 			break;
 	}
 
