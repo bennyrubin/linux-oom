@@ -107,6 +107,23 @@ static inline bool tsk_is_oom_victim(struct task_struct * tsk)
 }
 
 /*
+ * vm.lc_victim_bail (default 1): a task whose thread group has been chosen
+ * as an OOM victim stops doing reclaim work on its own behalf. Its memory
+ * comes back through exit_mmap(), and every direct-reclaim round or
+ * oom_lock backoff it performs first only delays that -- measured
+ * 2026-10-22 as a 2 s stall of every allocator on the node while a victim's
+ * fault thread finished a CPU-starved reclaim round and then looped on
+ * oom_lock misses that counted as progress (docs/serverless-lc-experiment.md).
+ * tsk->signal->oom_mm is per thread group, so this covers every thread of
+ * the victim, not only the task the killer picked.
+ */
+extern int sysctl_lc_victim_bail;
+static inline bool oom_victim_should_bail(void)
+{
+	return READ_ONCE(sysctl_lc_victim_bail) && tsk_is_oom_victim(current);
+}
+
+/*
  * Checks whether a page fault on the given mm is still reliable.
  * This is no longer true if the oom reaper started to reap the
  * address space which is reflected by MMF_UNSTABLE flag set in

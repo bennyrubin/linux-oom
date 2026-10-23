@@ -73,6 +73,8 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
 		LC_DIAG_RMQUEUE_NS,
 		LC_DIAG_PREP_NS,
 		LC_DIAG_ZERO_NS,
+		/* A victim thread left reclaim / the OOM path early (vm.lc_victim_bail). */
+		LC_VICTIM_BAIL,
 #ifdef CONFIG_NUMA_BALANCING
 		NUMA_PTE_UPDATES,
 		NUMA_HUGE_PTE_UPDATES,

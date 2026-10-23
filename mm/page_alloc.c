@@ -1315,6 +1315,8 @@ __always_inline bool free_pages_prepare(struct page *page,
 static int exp_mode;
 static int exp_batch;
 int sysctl_lc_victim_fastfree;
+int sysctl_lc_victim_bail = 1;
+static int lc_victim_bail_max = 1;
 int sysctl_lc_victim_gather_batches;
 int sysctl_lc_oom_kill_defer;
 static int lc_oom_kill_defer_max = 3;
@@ -4176,6 +4178,19 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * making progress for us.
 	 */
 	if (!mutex_trylock(&oom_lock)) {
+		/*
+		 * A victim must not sleep here and must not report the miss as
+		 * progress: with *did_some_progress left at 0 the caller's
+		 * "victim with ALLOC_OOM" check fails the allocation and the
+		 * thread goes on to exit (vm.lc_victim_bail).
+		 */
+		if (oom_victim_should_bail()) {
+			count_vm_event(LC_VICTIM_BAIL);
+			oom_alloc_trace_lc("event=oom_lock_victim_bail pid=%d tgid=%d order=%u gfp=%x\n",
+					   current->pid, current->tgid, order,
+					   (__force unsigned int)gfp_mask);
+			return NULL;
+		}
 		*did_some_progress = 1;
 		oom_alloc_trace_lc("event=oom_lock_sleep_enter pid=%d tgid=%d order=%u gfp=%x\n",
 				   current->pid, current->tgid, order,
@@ -5027,6 +5042,21 @@ retry:
 	/* Avoid recursion of direct reclaim */
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
+
+	/*
+	 * A thread of an OOM victim has just had its go at the memory
+	 * reserves above (ALLOC_OOM). Reclaiming on its behalf is wasted
+	 * work that only postpones exit_mmap(), where its memory actually
+	 * comes back, so fail the allocation now (vm.lc_victim_bail). The
+	 * page fault returns VM_FAULT_OOM to a task that is already dying.
+	 */
+	if (!(gfp_mask & __GFP_NOFAIL) && oom_victim_should_bail()) {
+		count_vm_event(LC_VICTIM_BAIL);
+		oom_alloc_trace_lc("event=slowpath_victim_bail pid=%d tgid=%d order=%u gfp=%x\n",
+				   current->pid, current->tgid, order,
+				   (__force unsigned int)gfp_mask);
+		goto nopage;
+	}
 
 	/*
 	 * Ordinary allocations get one bounded direct-reclaim pass. A
@@ -7106,6 +7136,7 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
 	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
+	{ .procname = "lc_victim_bail", .data = &sysctl_lc_victim_bail, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_bail_max },
 	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
 	{ .procname = "lc_oom_kill_defer", .data = &sysctl_lc_oom_kill_defer, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_oom_kill_defer_max },
 	{ .procname = "lc_exp_cache_kb", .data = &exp_cache_kb, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_cache_max },

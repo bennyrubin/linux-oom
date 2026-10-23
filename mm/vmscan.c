@@ -5834,6 +5834,9 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
+		if (oom_victim_should_bail())
+			break;
+
 		for_each_evictable_lru(lru) {
 			if (nr[lru]) {
 				nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX);
@@ -6040,6 +6043,11 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
+
+		if (oom_victim_should_bail()) {
+			mem_cgroup_iter_break(target_memcg, memcg);
+			break;
+		}
 
 		shrink_lruvec(lruvec, sc);
 
@@ -6385,6 +6393,11 @@ retry:
 		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
 
 	do {
+		/* A dying victim stops its in-flight round (vm.lc_victim_bail). */
+		if (oom_victim_should_bail()) {
+			count_vm_event(LC_VICTIM_BAIL);
+			break;
+		}
 		if (!sc->proactive)
 			vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
 					sc->priority);

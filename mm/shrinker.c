@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/memcontrol.h>
+#include <linux/oom.h>
 #include <linux/rwsem.h>
 #include <linux/shrinker.h>
 #include <linux/rculist.h>
@@ -655,6 +656,10 @@ unsigned long shrink_slab(gfp_t gfp_mask, int nid, struct mem_cgroup *memcg,
 			.nid = nid,
 			.memcg = memcg,
 		};
+
+		/* A dying OOM victim stops shrinking on its own behalf (vm.lc_victim_bail). */
+		if (oom_victim_should_bail())
+			break;
 
 		if (!shrinker_try_get(shrinker))
 			continue;

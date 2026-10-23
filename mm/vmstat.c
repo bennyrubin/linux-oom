@@ -1351,6 +1351,7 @@ const char * const vmstat_text[] = {
 	"lc_diag_rmqueue_ns",
 	"lc_diag_prep_ns",
 	"lc_diag_zero_ns",
+	"lc_victim_bail",
 
 #ifdef CONFIG_NUMA_BALANCING
 	"numa_pte_updates",
