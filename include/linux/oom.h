@@ -99,6 +99,10 @@ static inline vm_fault_t check_stable_address_space(struct mm_struct *mm)
 long oom_badness(struct task_struct *p,
 		unsigned long totalpages);
 
+bool oom_unkillable_task(struct task_struct *p);
+unsigned long oom_badness_by_adj_score(struct task_struct *p,
+				       unsigned long totalpages);
+
 extern bool out_of_memory(struct oom_control *oc);
 
 extern void exit_oom_victim(void);

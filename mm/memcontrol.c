@@ -117,6 +117,13 @@ struct vmpressure *memcg_to_vmpressure(struct mem_cgroup *memcg)
 	return &memcg->vmpressure;
 }
 
+struct mem_cgroup_thrash *memcg_to_cg_thrash(struct mem_cgroup *memcg)
+{
+	if (!memcg)
+		memcg = root_mem_cgroup;
+	return &memcg->cg_thrash;
+}
+
 struct mem_cgroup *vmpressure_to_memcg(struct vmpressure *vmpr)
 {
 	return container_of(vmpr, struct mem_cgroup, vmpressure);
@@ -859,6 +866,24 @@ unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 		return 0;
 
 	return READ_ONCE(memcg->vmstats->events[i]);
+}
+
+/* UA killer: major faults of the memcg */
+unsigned long memcg_account_page_mjfault(struct mem_cgroup *memcg)
+{
+	return memcg_events(memcg, PGMAJFAULT);
+}
+
+/* UA killer: evictions + activations of the memcg, over all nodes */
+unsigned long memcg_account_page_eviction(struct mem_cgroup *memcg)
+{
+	unsigned long page_eviction = 0;
+	int node;
+
+	for_each_node(node)
+		page_eviction += atomic_long_read(&memcg->nodeinfo[node]->lruvec.nonresident_age);
+
+	return page_eviction;
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -1654,6 +1679,69 @@ static bool mem_cgroup_out_of_memory(struct mem_cgroup *memcg, gfp_t gfp_mask,
 unlock:
 	mutex_unlock(&oom_lock);
 	return ret;
+}
+
+/* UA killer: the memcg holding the task with the highest score so far */
+struct oom_score_memcg {
+	int oom_points;
+	int task_nums;
+	struct mem_cgroup *memcg;
+};
+
+static void oom_score_memcg_evaluate(struct mem_cgroup *memcg,
+				     struct oom_score_memcg *score_memcg)
+{
+	unsigned long total_pages = totalram_pages() + total_swap_pages;
+	struct css_task_iter it;
+	struct task_struct *task;
+	int task_nums = 0;
+	bool chosen = false;
+
+	/* only the tasks of this memcg itself */
+	css_task_iter_start(&memcg->css, 0, &it);
+	while ((task = css_task_iter_next(&it))) {
+		int oom_points;
+
+		if (oom_unkillable_task(task))
+			continue;
+
+		task_nums++;
+
+		oom_points = oom_badness_by_adj_score(task, total_pages);
+		/* eligible only above 850 */
+		if (oom_points > 850 && oom_points > score_memcg->oom_points) {
+			score_memcg->memcg = memcg;
+			score_memcg->oom_points = oom_points;
+			chosen = true;
+		}
+	}
+
+	if (chosen)
+		score_memcg->task_nums = task_nums;
+
+	css_task_iter_end(&it);
+}
+
+/*
+ * UA killer: @memcg is thrashing. Kill in the memcg holding the task with the
+ * highest oom_score_adj, then clear @memcg's samples.
+ */
+void mem_cgroup_by_oom_score(struct mem_cgroup *memcg)
+{
+	struct oom_score_memcg score_memcg = {
+		.oom_points = 0,
+		.task_nums = 0,
+		.memcg = NULL,
+	};
+	struct mem_cgroup *iter;
+
+	for_each_mem_cgroup_tree(iter, root_mem_cgroup)
+		oom_score_memcg_evaluate(iter, &score_memcg);
+
+	if (score_memcg.memcg) {
+		mem_cgroup_out_of_memory(score_memcg.memcg, GFP_KERNEL, 0);
+		mem_cgroup_thrash_buffer_clear(memcg);
+	}
 }
 
 /*
@@ -3751,6 +3839,7 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 		goto fail;
 
 	INIT_WORK(&memcg->high_work, high_work_func);
+	mem_cgroup_thrash_init(&memcg->cg_thrash);
 	vmpressure_init(&memcg->vmpressure);
 	INIT_LIST_HEAD(&memcg->memory_peaks);
 	INIT_LIST_HEAD(&memcg->swap_peaks);

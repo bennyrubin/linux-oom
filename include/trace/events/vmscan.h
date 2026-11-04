@@ -535,6 +535,30 @@ TRACE_EVENT(mm_vmscan_throttled,
 		__entry->usec_delayed,
 		show_throttle_flags(__entry->reason))
 );
+
+/* UA killer: the thrashing test of a memcg was positive */
+TRACE_EVENT(ua_thrash_detect,
+
+	TP_PROTO(unsigned short memcg_id, unsigned long pgmj, unsigned long pgev),
+
+	TP_ARGS(memcg_id, pgmj, pgev),
+
+	TP_STRUCT__entry(
+		__field(unsigned short, memcg_id)
+		__field(unsigned long, pgmj)
+		__field(unsigned long, pgev)
+	),
+
+	TP_fast_assign(
+		__entry->memcg_id = memcg_id;
+		__entry->pgmj = pgmj;
+		__entry->pgev = pgev;
+	),
+
+	TP_printk("memcg_id=%u pgmj=%lu pgev=%lu",
+		__entry->memcg_id, __entry->pgmj, __entry->pgev)
+);
+
 #endif /* _TRACE_VMSCAN_H */
 
 /* This part must be outside protection */

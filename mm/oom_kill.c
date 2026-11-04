@@ -160,7 +160,7 @@ static inline bool is_sysrq_oom(struct oom_control *oc)
 }
 
 /* return true if the task is not adequate as candidate victim task. */
-static bool oom_unkillable_task(struct task_struct *p)
+bool oom_unkillable_task(struct task_struct *p)
 {
 	if (is_global_init(p))
 		return true;
@@ -237,6 +237,47 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 	points += adj;
 
 	return points;
+}
+
+/*
+ * UA killer: the badness of a task is its oom_score_adj alone, with the 3% root
+ * bonus of 4.12's oom_badness(). @totalpages is unused, as in the original.
+ */
+unsigned long oom_badness_by_adj_score(struct task_struct *p,
+				       unsigned long totalpages)
+{
+	long points;
+	long adj;
+
+	if (oom_unkillable_task(p))
+		return 0;
+
+	p = find_lock_task_mm(p);
+	if (!p)
+		return 0;
+
+	/*
+	 * Do not even consider tasks which are explicitly marked oom
+	 * unkillable or have been already oom reaped or the are in
+	 * the middle of vfork
+	 */
+	adj = (long)p->signal->oom_score_adj;
+	if (adj == OOM_SCORE_ADJ_MIN ||
+			test_bit(MMF_OOM_SKIP, &p->mm->flags) ||
+			in_vfork(p)) {
+		task_unlock(p);
+		return 0;
+	}
+
+	/* the priority is decided by the user alone */
+	points = adj;
+	task_unlock(p);
+
+	/* Root processes get 3% bonus, as 4.12's oom_badness() */
+	if (has_capability_noaudit(p, CAP_SYS_ADMIN))
+		points -= (points * 3) / 100;
+
+	return points > 0 ? points : 1;
 }
 
 static const char * const oom_constraint_text[] = {

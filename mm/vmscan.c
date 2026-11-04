@@ -5978,6 +5978,24 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	return inactive_lru_pages > pages_for_compaction;
 }
 
+/*
+ * UA killer: sample @memcg's counters (at most once a second) and, if they rose
+ * over the last vm.cgth_time samples, kill.
+ */
+static void memcg_thrash_evaluate(struct mem_cgroup *memcg)
+{
+	unsigned long page_mjfault = memcg_account_page_mjfault(memcg);
+	unsigned long page_eviction = memcg_account_page_eviction(memcg);
+
+	if (mem_cgroup_thrash_add(memcg, page_mjfault, page_eviction)) {
+		if (mem_cgroup_thrash_on(memcg)) {
+			trace_ua_thrash_detect(mem_cgroup_id(memcg), page_mjfault,
+					       page_eviction);
+			mem_cgroup_by_oom_score(memcg);
+		}
+	}
+}
+
 static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
@@ -6012,6 +6030,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		 * memory is explicitly protected. Avoid soft lockups.
 		 */
 		cond_resched();
+
+		/* UA killer: before this memcg is reclaimed; vm.cgth_time 0 = off */
+		if (default_curr_num > 0)
+			memcg_thrash_evaluate(memcg);
 
 		mem_cgroup_calculate_protection(target_memcg, memcg);
 

@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/page_counter.h>
 #include <linux/vmpressure.h>
+#include <linux/memcgthrash.h>
 #include <linux/eventfd.h>
 #include <linux/mm.h>
 #include <linux/vmstat.h>
@@ -220,6 +221,9 @@ struct mem_cgroup {
 
 	/* vmpressure notifications */
 	struct vmpressure vmpressure;
+
+	/* UA killer thrashing detection */
+	struct mem_cgroup_thrash cg_thrash;
 
 	/*
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
