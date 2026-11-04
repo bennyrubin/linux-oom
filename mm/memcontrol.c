@@ -868,22 +868,44 @@ unsigned long memcg_events(struct mem_cgroup *memcg, int event)
 	return READ_ONCE(memcg->vmstats->events[i]);
 }
 
-/* UA killer: major faults of the memcg */
+/*
+ * UA killer: major faults of the memcg itself, as 4.12's memcg_sum_events()
+ * (port: local, flushed by the caller).
+ */
 unsigned long memcg_account_page_mjfault(struct mem_cgroup *memcg)
 {
-	return memcg_events(memcg, PGMAJFAULT);
+	return READ_ONCE(memcg->vmstats->events_local[memcg_events_index(PGMAJFAULT)]);
 }
 
-/* UA killer: evictions + activations of the memcg, over all nodes */
-unsigned long memcg_account_page_eviction(struct mem_cgroup *memcg)
+static unsigned long memcg_nonresident_age(struct mem_cgroup *memcg)
 {
-	unsigned long page_eviction = 0;
+	unsigned long age = 0;
 	int node;
 
 	for_each_node(node)
-		page_eviction += atomic_long_read(&memcg->nodeinfo[node]->lruvec.nonresident_age);
+		age += atomic_long_read(&memcg->nodeinfo[node]->lruvec.nonresident_age);
+	return age;
+}
 
-	return page_eviction;
+/*
+ * UA killer: evictions + activations of the memcg itself, over all nodes, as
+ * 4.12's lruvec->inactive_age. 6.16 ages every ancestor too, so the port takes
+ * the memcg's age minus its children's (children read first, as aging goes
+ * from the leaf up; released children's counts stay in the parent).
+ */
+unsigned long memcg_account_page_eviction(struct mem_cgroup *memcg)
+{
+	struct cgroup_subsys_state *child_css;
+	unsigned long children_age = 0;
+	unsigned long own_age;
+
+	rcu_read_lock();
+	css_for_each_child(child_css, &memcg->css)
+		children_age += memcg_nonresident_age(mem_cgroup_from_css(child_css));
+	rcu_read_unlock();
+	own_age = memcg_nonresident_age(memcg);
+
+	return own_age > children_age ? own_age - children_age : 0;
 }
 
 #ifdef CONFIG_MEMCG_V1
@@ -1681,6 +1703,28 @@ unlock:
 	return ret;
 }
 
+/*
+ * UA killer: mem_cgroup_out_of_memory() without 6.16's margin check, as 4.12's
+ * (port: a victim memcg below its memory.max has a margin, and would never be
+ * killed).
+ */
+static void mem_cgroup_out_of_memory_no_margin(struct mem_cgroup *memcg,
+					       gfp_t gfp_mask, int order)
+{
+	struct oom_control oc = {
+		.zonelist = NULL,
+		.nodemask = NULL,
+		.memcg = memcg,
+		.gfp_mask = gfp_mask,
+		.order = order,
+	};
+
+	if (mutex_lock_killable(&oom_lock))
+		return;
+	out_of_memory(&oc);
+	mutex_unlock(&oom_lock);
+}
+
 /* UA killer: the memcg holding the task with the highest score so far */
 struct oom_score_memcg {
 	int oom_points;
@@ -1739,7 +1783,7 @@ void mem_cgroup_by_oom_score(struct mem_cgroup *memcg)
 		oom_score_memcg_evaluate(iter, &score_memcg);
 
 	if (score_memcg.memcg) {
-		mem_cgroup_out_of_memory(score_memcg.memcg, GFP_KERNEL, 0);
+		mem_cgroup_out_of_memory_no_margin(score_memcg.memcg, GFP_KERNEL, 0);
 		mem_cgroup_thrash_buffer_clear(memcg);
 	}
 }

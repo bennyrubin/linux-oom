@@ -11,7 +11,7 @@
 #include <linux/spinlock.h>
 #include <linux/sysctl.h>
 
-/* default thrashing tolerance (samples), vm.cgth_time */
+/* default thrashing tolerance (samples), vm.cgth_time (vm.default_curr_num in the original) */
 unsigned int default_curr_num = 3;
 
 /* called with sr_lock held, or before the memcg is visible */
@@ -78,9 +78,10 @@ bool mem_cgroup_thrash_add(struct mem_cgroup *memcg, unsigned long pgmj,
 
 /*
  * True if each of the last @num samples, walking back from @index, is larger
- * than the one before it. Kept as in the original, including its sentinel
- * (last == -1) and its wrap (index 0 is replaced by the last slot before it is
- * read, and the walk can read before the array when @index starts at 0).
+ * than the one before it. As the original, sentinel (last == -1) included,
+ * except the wrap: the original replaced index 0 by the last slot before
+ * reading it and read buffers[-1], [-2] when the walk started at slot 0; here
+ * the walk wraps from -1 to the last slot (port fix, memory safety).
  */
 static bool buffers_increase(int num, int index, unsigned long *buffers)
 {
@@ -93,7 +94,7 @@ static bool buffers_increase(int num, int index, unsigned long *buffers)
 			continue;
 		}
 
-		if (index == 0)
+		if (index < 0)
 			index = MEM_CGROUP_MAX_THRASH_BUFFER - 1;
 
 		if (last <= buffers[index]) {
@@ -120,6 +121,9 @@ bool mem_cgroup_thrash_on(struct mem_cgroup *memcg)
 	return thrash_pgmj || thrash_pgev;
 }
 
+/* the original allowed 100, past the buffers (port fix, memory safety) */
+static int cgth_time_max = MEM_CGROUP_MAX_THRASH_BUFFER;
+
 static const struct ctl_table memcg_thrash_sysctls[] = {
 	{
 		.procname	= "cgth_time",
@@ -128,7 +132,7 @@ static const struct ctl_table memcg_thrash_sysctls[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE_HUNDRED,
+		.extra2		= &cgth_time_max,
 	},
 };
 

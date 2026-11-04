@@ -5984,8 +5984,13 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
  */
 static void memcg_thrash_evaluate(struct mem_cgroup *memcg)
 {
-	unsigned long page_mjfault = memcg_account_page_mjfault(memcg);
-	unsigned long page_eviction = memcg_account_page_eviction(memcg);
+	unsigned long page_mjfault;
+	unsigned long page_eviction;
+
+	/* port: 6.16's event counters are flushed lazily, 4.12's were live */
+	mem_cgroup_flush_stats(memcg);
+	page_mjfault = memcg_account_page_mjfault(memcg);
+	page_eviction = memcg_account_page_eviction(memcg);
 
 	if (mem_cgroup_thrash_add(memcg, page_mjfault, page_eviction)) {
 		if (mem_cgroup_thrash_on(memcg)) {
