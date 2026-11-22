@@ -1347,7 +1347,7 @@ struct ab_zone_sample {
 };
 static DEFINE_PER_CPU(struct ab_zone_sample, ab_zone_sample);
 
-static noinline unsigned long exp_zone_lock(struct zone *zone)
+static noinline unsigned long exp_zone_lock_slow(struct zone *zone)
 {
 	unsigned long flags;
 	u64 start = 0, acquired = 0;
@@ -1393,7 +1393,7 @@ acquired:
 	return flags;
 }
 
-static noinline void exp_zone_unlock(struct zone *zone, unsigned long flags)
+static noinline void exp_zone_unlock_slow(struct zone *zone, unsigned long flags)
 {
 	struct ab_zone_sample *sample = this_cpu_ptr(&ab_zone_sample);
 
@@ -1410,6 +1410,69 @@ static noinline void exp_zone_unlock(struct zone *zone, unsigned long flags)
 	} else {
 		spin_unlock_irqrestore(&zone->lock, flags);
 	}
+}
+
+/*
+ * LEAN (2026-10-28, uncommitted experiment): with the experiment modes off and
+ * the ab tracepoint disabled, a zone-lock operation is exactly the stock
+ * spin_lock_irqsave; the experiment and tracing paths live out of line.
+ */
+/*
+ * LEAN (2026-10-28): vm.lc_exp_batch_adaptive = 1 makes the batching cap a
+ * contention response instead of an unconditional hand-off: a bulk free
+ * still counts pages in lc_exp_batch chunks but only drops zone->lock at a
+ * chunk boundary while an LC task is waiting for it (zone->exp_lc_pending,
+ * registered below on every LC acquisition). Without an LC waiter the drain
+ * holds the lock as stock does, so the LC's own exits and the floor keep
+ * stock's physical page runs and throughput; with one, the hold stays
+ * bounded to one chunk exactly as before.
+ */
+/*
+ * 0 = release at every chunk boundary (the paper's unconditional cap);
+ * 1 = release only while an LC task waits for this zone's lock;
+ * 2 = as 1, and a holder that is itself an LC task never releases: the cap
+ *     is a courtesy BE holders pay to LC faults, LC-vs-LC keeps stock's
+ *     long holds (and stock's physical page runs).
+ */
+int sysctl_lc_exp_batch_adaptive = 2;
+static int lc_exp_batch_adaptive_max = 2;
+
+static __always_inline bool exp_cap_release_due(struct zone *zone)
+{
+	int mode = READ_ONCE(sysctl_lc_exp_batch_adaptive);
+
+	if (!mode)
+		return true;
+	if (mode == 2 && in_task() && oom_alloc_current_lc())
+		return false;
+	return atomic_read(&zone->exp_lc_pending) != 0;
+}
+
+static __always_inline unsigned long exp_zone_lock(struct zone *zone)
+{
+	unsigned long flags;
+
+	if (likely(!READ_ONCE(exp_mode) && !trace_mm_ab_zone_lock_enabled())) {
+		if (in_task() && oom_alloc_current_lc()) {
+			atomic_inc(&zone->exp_lc_pending);
+			spin_lock_irqsave(&zone->lock, flags);
+			atomic_dec(&zone->exp_lc_pending);
+		} else {
+			spin_lock_irqsave(&zone->lock, flags);
+		}
+		return flags;
+	}
+	return exp_zone_lock_slow(zone);
+}
+
+static __always_inline void exp_zone_unlock(struct zone *zone, unsigned long flags)
+{
+	if (likely(!READ_ONCE(exp_mode) && !trace_mm_ab_zone_lock_enabled() &&
+		   !this_cpu_ptr(&ab_zone_sample)->zone)) {
+		spin_unlock_irqrestore(&zone->lock, flags);
+		return;
+	}
+	exp_zone_unlock_slow(zone, flags);
 }
 
 /* Called with PCP locked, but never with zone->lock held. */
@@ -1589,8 +1652,10 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 			__free_one_page(page, pfn, zone, order, mt, FPI_NONE);
 			trace_mm_page_pcpu_drain(page, order, mt);
 			if (cap && (budget -= nr_pages) <= 0 && count > 0) {
-				exp_zone_unlock(zone, flags);
-				flags = exp_zone_lock(zone);
+				if (exp_cap_release_due(zone)) {
+					exp_zone_unlock(zone, flags);
+					flags = exp_zone_lock(zone);
+				}
 				budget = cap;
 			}
 		} while (count > 0 && !list_empty(list));
@@ -1899,7 +1964,7 @@ static inline bool should_skip_init(gfp_t flags)
 	return (flags & __GFP_SKIP_ZERO);
 }
 
-inline void post_alloc_hook(struct page *page, unsigned int order,
+static noinline void post_alloc_hook_measured(struct page *page, unsigned int order,
 				gfp_t gfp_flags)
 {
 	bool init = !want_init_on_free() && want_init_on_alloc(gfp_flags) &&
@@ -1985,6 +2050,74 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 			trace_mm_lc_page_prepare(page, order, gfp_flags,
 				prepare_ns, zero_ns);
 	}
+}
+
+inline void post_alloc_hook(struct page *page, unsigned int order,
+				gfp_t gfp_flags)
+{
+	/* LEAN: measurement only when the tracepoint or vm.lc_alloc_diag asks for it. */
+	if (unlikely((trace_mm_lc_page_prepare_enabled() || READ_ONCE(sysctl_lc_alloc_diag)) &&
+		     oom_alloc_current_lc())) {
+		post_alloc_hook_measured(page, order, gfp_flags);
+		return;
+	}
+
+	bool init = !want_init_on_free() && want_init_on_alloc(gfp_flags) &&
+			!should_skip_init(gfp_flags);
+	bool zero_tags = init && (gfp_flags & __GFP_ZEROTAGS);
+	int i;
+
+	set_page_private(page, 0);
+
+	arch_alloc_page(page, order);
+	debug_pagealloc_map_pages(page, 1 << order);
+
+	/*
+	 * Page unpoisoning must happen before memory initialization.
+	 * Otherwise, the poison pattern will be overwritten for __GFP_ZERO
+	 * allocations and the page unpoisoning code will complain.
+	 */
+	kernel_unpoison_pages(page, 1 << order);
+
+	/*
+	 * As memory initialization might be integrated into KASAN,
+	 * KASAN unpoisoning and memory initializion code must be
+	 * kept together to avoid discrepancies in behavior.
+	 */
+
+	/*
+	 * If memory tags should be zeroed
+	 * (which happens only when memory should be initialized as well).
+	 */
+	if (zero_tags) {
+		/* Initialize both memory and memory tags. */
+		for (i = 0; i != 1 << order; ++i)
+			tag_clear_highpage(page + i);
+
+		/* Take note that memory was initialized by the loop above. */
+		init = false;
+	}
+	if (!should_skip_kasan_unpoison(gfp_flags) &&
+	    kasan_unpoison_pages(page, order, init)) {
+		/* Take note that memory was initialized by KASAN. */
+		if (kasan_has_integrated_init())
+			init = false;
+	} else {
+		/*
+		 * If memory tags have not been set by KASAN, reset the page
+		 * tags to ensure page_address() dereferencing does not fault.
+		 */
+		for (i = 0; i != 1 << order; ++i)
+			page_kasan_tag_reset(page + i);
+	}
+	/* If memory is still not initialized, initialize it now. */
+	if (init)
+		kernel_init_pages(page, 1 << order);
+
+	set_page_owner(page, order, gfp_flags);
+	page_table_check_alloc(page, order);
+	pgalloc_tag_add(page, current, 1 << order);
+
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
@@ -2620,7 +2753,16 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 	unsigned long flags;
 	int i, cap = READ_ONCE(exp_batch);
 
-	if (cap)
+	/*
+	 * LEAN: the refill cap follows the same contention rule as the free-side
+	 * release. A streaming allocator's PCP refill grows to base_batch <<
+	 * alloc_factor (2016 pages here); clamping every refill to 64 pages
+	 * costs an LC fault stream ~30x the zone-lock acquisitions and splits
+	 * higher-order blocks into short physical runs. Clamp only when an LC
+	 * task is waiting for this zone's lock (and never an LC's own refill
+	 * in mode 2).
+	 */
+	if (cap && exp_cap_release_due(zone))
 		count = min(count, (unsigned long)max(1, cap >> order));
 	i = exp_take(zone, order, migratetype, count, list);
 	if (i)
@@ -2633,8 +2775,19 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 		flags = exp_zone_lock(zone);
 	}
 	for (i = 0; i < count; ++i) {
-		struct page *page = __rmqueue(zone, order, migratetype,
-					      alloc_flags, &rmqm);
+		struct page *page;
+
+		/*
+		 * LEAN: an uncontended refill may run to its full size, but once
+		 * an LC task starts waiting for this zone's lock the hold ends at
+		 * the next lc_exp_batch boundary (the caller is happy with fewer
+		 * pages). This is what bounds an LC fault's wait behind a BE
+		 * refill without taxing refills nobody is waiting for.
+		 */
+		if (cap && i && (i % cap) == 0 && exp_cap_release_due(zone))
+			break;
+
+		page = __rmqueue(zone, order, migratetype, alloc_flags, &rmqm);
 		if (unlikely(page == NULL))
 			break;
 
@@ -3068,8 +3221,10 @@ static void free_folios_to_buddy(struct folio_batch *folios)
 		split_large_buddy(zone, &folio->page, pfn, order, FPI_NONE);
 		__count_vm_events(PGFREE, 1 << order);
 		if (cap && (budget -= 1 << order) <= 0 && i + 1 < folios->nr) {
-			exp_zone_unlock(zone, flags);
-			flags = exp_zone_lock(zone);
+			if (exp_cap_release_due(zone)) {
+				exp_zone_unlock(zone, flags);
+				flags = exp_zone_lock(zone);
+			}
 			budget = cap;
 		}
 	}
@@ -3389,8 +3544,7 @@ static int nr_pcp_alloc(struct per_cpu_pages *pcp, struct zone *zone, int order)
 }
 
 /* Remove page from the per-cpu list, caller must protect the list */
-static inline
-struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+static noinline struct page *__rmqueue_pcplist_traced(struct zone *zone, unsigned int order,
 			int migratetype,
 			unsigned int alloc_flags,
 			struct per_cpu_pages *pcp,
@@ -3433,6 +3587,41 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
                              ab_before, pcp->count, ab_empty, page != NULL,
                              ab_start, ktime_get_ns());
     return page;
+}
+
+static inline
+struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+			int migratetype,
+			unsigned int alloc_flags,
+			struct per_cpu_pages *pcp,
+			struct list_head *list)
+{
+	struct page *page;
+
+	/* LEAN: the ab tracepoint variant is out of line. */
+	if (unlikely(trace_mm_ab_pcp_alloc_enabled()))
+		return __rmqueue_pcplist_traced(zone, order, migratetype, alloc_flags, pcp, list);
+
+	do {
+		if (list_empty(list)) {
+			int batch = nr_pcp_alloc(pcp, zone, order);
+			int alloced;
+
+			alloced = rmqueue_bulk(zone, order,
+					batch, list,
+					migratetype, alloc_flags);
+
+			pcp->count += alloced << order;
+			if (unlikely(list_empty(list)))
+				return NULL;
+		}
+
+		page = list_first_entry(list, struct page, pcp_list);
+		list_del(&page->pcp_list);
+		pcp->count -= 1 << order;
+	} while (check_new_pages(page, order));
+
+	return page;
 }
 
 /* Lock and remove page from the per-cpu list */
@@ -5197,7 +5386,7 @@ got_pg:
 	return page;
 }
 
-static bool lc_allocation_in_reserve(struct page *page, gfp_t gfp_mask,
+static __always_inline bool lc_allocation_in_reserve(struct page *page, gfp_t gfp_mask,
 				     unsigned int order,
 				     const struct alloc_context *ac)
 {
@@ -7135,6 +7324,7 @@ out:
 static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
+	{ .procname = "lc_exp_batch_adaptive", .data = &sysctl_lc_exp_batch_adaptive, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_exp_batch_adaptive_max },
 	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
 	{ .procname = "lc_victim_bail", .data = &sysctl_lc_victim_bail, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_bail_max },
 	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
