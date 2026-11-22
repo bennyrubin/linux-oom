@@ -1428,14 +1428,103 @@ static noinline void exp_zone_unlock_slow(struct zone *zone, unsigned long flags
  * bounded to one chunk exactly as before.
  */
 /*
- * 0 = release at every chunk boundary (the paper's unconditional cap);
- * 1 = release only while an LC task waits for this zone's lock;
- * 2 = as 1, and a holder that is itself an LC task never releases: the cap
- *     is a courtesy BE holders pay to LC faults, LC-vs-LC keeps stock's
- *     long holds (and stock's physical page runs).
+ * vm.lc_exp_batch_adaptive: when a zone-lock holder working in lc_exp_batch
+ * chunks gives the lock up at a chunk boundary.
+ * 0 = always (the paper's unconditional cap);
+ * 1 = only while an LC task waits for this zone's lock;
+ * 2 = as 1, and a holder that is itself an LC task never releases;
+ * 3 = only while anybody waits for this zone's lock (spin_is_contended).
+ *
+ * vm.lc_exp_batch_flags (bits, meaningful for modes 1..3):
+ * 1 = an LC task's own PCP refill is always clamped to one chunk (its own
+ *     on-CPU refill is the per-fault tail the cap removed);
+ * 2 = pressure clamp: a non-LC refill is one chunk once the zone's free
+ *     pages are at or below low watermark + LC reserve, re-checked under
+ *     the lock at every chunk boundary, so BE grabs near the watermark stay
+ *     as fine-grained as with the unconditional cap;
+ * 4 = an LC task registers as a waiter only after a failed trylock;
+ * 8 = a non-LC task that gets the lock while an LC task is already waiting
+ *     hands it straight on and re-queues (bounded), so an LC task that
+ *     arrived behind a convoy of BE waiters does not wait for each of them
+ *     to do a chunk first;
+ * 16 = an exiting LC task (PF_EXITING: its address-space teardown) takes the
+ *     lock as a non-LC task: it does not register as an LC waiter, and with
+ *     bit 8 it hands the lock on to a waiting LC task. Its frees are not a
+ *     latency-critical operation; LC tasks torn down in parallel then keep
+ *     stock's long holds among themselves;
+ * 32 = run refill: an LC task's order-0 refill takes ONE contiguous free
+ *     block (order sized like stock's scaled batch, at most a pageblock)
+ *     and keeps it as this CPU's run; pages are then handed out one at a
+ *     time from the run. Nothing is split or listed up front, so a refill
+ *     is constant work both under zone->lock and for the LC task itself,
+ *     whatever its size. Not used when the block would not fit above low
+ *     watermark + LC reserve (checked exactly, under zone->lock), or when
+ *     no block that large is free; the refill then falls back to the
+ *     chunked loop;
+ * 64 = run reclaim: an LC task that reaches the LC reserve takes every
+ *     CPU's run of that zone back before the kill decision is considered,
+ *     so pages parked in a run (for instance on a CPU whose LC task stopped
+ *     allocating) are never the reason for a kill. An owner that is still
+ *     allocating keeps its run until then: it uses the pages within
+ *     milliseconds, and returning them at the first sign of pressure only
+ *     shuttled blocks back and forth (measured 2026-11-22).
  */
-int sysctl_lc_exp_batch_adaptive = 2;
-static int lc_exp_batch_adaptive_max = 2;
+int sysctl_lc_exp_batch_adaptive;
+static int lc_exp_batch_adaptive_max = 3;
+int sysctl_lc_exp_batch_flags;
+static int lc_exp_batch_flags_max = 127;
+#define LC_EXP_BATCH_LC_REFILL_CLAMP	1
+#define LC_EXP_BATCH_PRESSURE_CLAMP	2
+#define LC_EXP_BATCH_TRYLOCK_FIRST	4
+#define LC_EXP_BATCH_BE_DEFER		8
+#define LC_EXP_BATCH_EXIT_AS_BE		16
+#define LC_EXP_BATCH_LC_BLOCK_REFILL	32
+#define LC_EXP_BATCH_RUN_RECLAIM	64
+
+/*
+ * Run refill (LC_EXP_BATCH_LC_BLOCK_REFILL). One contiguous run of free
+ * pages per CPU, taken from the buddy allocator as a single block and handed
+ * out page by page to order-0 allocations of the same zone and migratetype.
+ * Run pages have left the free lists (not in NR_FREE_PAGES) and are not in
+ * pcp->count. The run is protected like the per-CPU lists: by the pcp lock
+ * of (its CPU, run->zone), which every user holds.
+ */
+struct exp_run {
+	struct zone *zone;
+	struct page *page;
+	unsigned int left;
+	int mt;
+};
+static DEFINE_PER_CPU(struct exp_run, exp_lc_run);
+/* Pages: taken as runs; taken back by an LC at its reserve; returned by
+ * drains and the periodic decay. */
+static atomic_long_t exp_run_refills, exp_run_refill_pages,
+		     exp_run_reclaim_pages, exp_run_drain_pages;
+
+/* Called with zone->lock held and IRQs off; returns with it held again. */
+static noinline void exp_zone_lock_defer(struct zone *zone)
+{
+	int tries;
+
+	for (tries = 0; tries < 8 && atomic_read(&zone->exp_lc_pending); tries++) {
+		spin_unlock(&zone->lock);
+		spin_lock(&zone->lock);
+	}
+}
+
+static __always_inline bool exp_task_is_lc(void)
+{
+	return in_task() && oom_alloc_current_lc();
+}
+
+/* Does this task take zone->lock as a latency-critical waiter? */
+static __always_inline bool exp_lock_as_lc(void)
+{
+	if (!exp_task_is_lc())
+		return false;
+	return !((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_EXIT_AS_BE) &&
+		 (current->flags & PF_EXITING));
+}
 
 static __always_inline bool exp_cap_release_due(struct zone *zone)
 {
@@ -1443,9 +1532,33 @@ static __always_inline bool exp_cap_release_due(struct zone *zone)
 
 	if (!mode)
 		return true;
-	if (mode == 2 && in_task() && oom_alloc_current_lc())
+	if (mode == 3)
+		return spin_is_contended(&zone->lock);
+	if (mode == 2 && exp_task_is_lc())
 		return false;
 	return atomic_read(&zone->exp_lc_pending) != 0;
+}
+
+/* Non-LC refills go back to one chunk when the zone is near the BE watermark. */
+static __always_inline bool exp_zone_pressure(struct zone *zone)
+{
+	return zone_page_state(zone, NR_FREE_PAGES) <=
+		low_wmark_pages(zone) + READ_ONCE(zone->lc_reserve_pages);
+}
+
+/* Should this PCP refill end at the current chunk boundary? */
+static __always_inline bool exp_refill_stop(struct zone *zone, bool lc)
+{
+	int mode = READ_ONCE(sysctl_lc_exp_batch_adaptive);
+	int fl = READ_ONCE(sysctl_lc_exp_batch_flags);
+
+	if (!mode)
+		return true;
+	if (lc && (fl & LC_EXP_BATCH_LC_REFILL_CLAMP))
+		return true;
+	if (!lc && (fl & LC_EXP_BATCH_PRESSURE_CLAMP) && exp_zone_pressure(zone))
+		return true;
+	return exp_cap_release_due(zone);
 }
 
 static __always_inline unsigned long exp_zone_lock(struct zone *zone)
@@ -1453,12 +1566,19 @@ static __always_inline unsigned long exp_zone_lock(struct zone *zone)
 	unsigned long flags;
 
 	if (likely(!READ_ONCE(exp_mode) && !trace_mm_ab_zone_lock_enabled())) {
-		if (in_task() && oom_alloc_current_lc()) {
+		if (exp_lock_as_lc()) {
+			local_irq_save(flags);
+			if ((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_TRYLOCK_FIRST) &&
+			    spin_trylock(&zone->lock))
+				return flags;
 			atomic_inc(&zone->exp_lc_pending);
-			spin_lock_irqsave(&zone->lock, flags);
+			spin_lock(&zone->lock);
 			atomic_dec(&zone->exp_lc_pending);
 		} else {
 			spin_lock_irqsave(&zone->lock, flags);
+			if (unlikely((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_BE_DEFER) &&
+				     atomic_read(&zone->exp_lc_pending)))
+				exp_zone_lock_defer(zone);
 		}
 		return flags;
 	}
@@ -1591,6 +1711,17 @@ static int exp_show(struct seq_file *m, void *v)
 			zone->exp_drained, atomic_long_read(&zone->exp_lc_admissions),
 			atomic_long_read(&zone->exp_be_fallbacks));
 		spin_unlock_irqrestore(&zone->exp_lock, flags);
+	}
+	{
+		unsigned long parked = 0;
+		int cpu;
+
+		for_each_online_cpu(cpu)
+			parked += READ_ONCE(per_cpu(exp_lc_run, cpu).left);
+		seq_printf(m, "runs refills=%ld refill_pages=%ld reclaim_pages=%ld drain_pages=%ld parked_pages=%lu\n",
+			atomic_long_read(&exp_run_refills), atomic_long_read(&exp_run_refill_pages),
+			atomic_long_read(&exp_run_reclaim_pages),
+			atomic_long_read(&exp_run_drain_pages), parked);
 	}
 	return 0;
 }
@@ -2740,6 +2871,142 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 	return NULL;
 }
 
+/* Does @cpu hold a run of @zone (any zone if NULL)? */
+static bool exp_run_pending(struct zone *zone, int cpu)
+{
+	struct exp_run *run = &per_cpu(exp_lc_run, cpu);
+
+	return READ_ONCE(run->left) && (!zone || READ_ONCE(run->zone) == zone);
+}
+
+/*
+ * Give the unused rest of @cpu's run back to the buddy allocator, as the
+ * largest aligned blocks that tile it. Caller holds the pcp lock of
+ * (@cpu, @zone). Returns the number of pages returned.
+ */
+static unsigned int exp_run_flush(struct zone *zone, int cpu, atomic_long_t *stat)
+{
+	struct exp_run *run = &per_cpu(exp_lc_run, cpu);
+	unsigned long flags, pfn;
+	unsigned int left, n;
+
+	if (likely(!run->left) || run->zone != zone)
+		return 0;
+	pfn = page_to_pfn(run->page);
+	n = left = run->left;
+	run->left = 0;
+
+	flags = exp_zone_lock(zone);
+	while (left) {
+		unsigned int order = ilog2(left);
+		struct page *page = pfn_to_page(pfn);
+
+		if (pfn)
+			order = min_t(unsigned int, order, __ffs(pfn));
+		__free_one_page(page, pfn, zone, order,
+				get_pfnblock_migratetype(page, pfn), FPI_NONE);
+		pfn += 1UL << order;
+		left -= 1U << order;
+	}
+	exp_zone_unlock(zone, flags);
+	atomic_long_add(n, stat);
+	return n;
+}
+
+/*
+ * Take every CPU's run of @zone back. Task context, no pcp or zone lock
+ * held. Returns the number of pages returned to the buddy allocator.
+ */
+static unsigned int exp_run_reclaim(struct zone *zone)
+{
+	unsigned int n = 0;
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		struct per_cpu_pages *pcp;
+
+		if (!exp_run_pending(zone, cpu))
+			continue;
+		pcp = per_cpu_ptr(zone->per_cpu_pageset, cpu);
+		spin_lock(&pcp->lock);
+		n += exp_run_flush(zone, cpu, &exp_run_reclaim_pages);
+		spin_unlock(&pcp->lock);
+	}
+	return n;
+}
+
+/* Next page of this CPU's run, if it matches. Caller holds the pcp lock. */
+static __always_inline struct page *exp_run_take(struct zone *zone, int migratetype)
+{
+	struct exp_run *run = this_cpu_ptr(&exp_lc_run);
+
+	if (!run->left || run->zone != zone || run->mt != migratetype)
+		return NULL;
+	run->left--;
+	return run->page++;
+}
+
+/* Pages a run may take: free pages above low watermark + LC reserve. */
+static __always_inline long exp_run_room(struct zone *zone, bool exact)
+{
+	long free = exact ? zone_page_state_snapshot(zone, NR_FREE_PAGES) :
+			    zone_page_state(zone, NR_FREE_PAGES);
+
+	return free - low_wmark_pages(zone) - READ_ONCE(zone->lc_reserve_pages);
+}
+
+/*
+ * Take one free block of about @want pages from @migratetype's own free
+ * lists as this CPU's new run. Constant work under zone->lock: one list
+ * removal plus the buddy split of a larger block. The block must fit in
+ * the room above low watermark + LC reserve, computed under zone->lock
+ * from the exact free count (every change to it is made under that lock),
+ * so CPUs refilling at the same time cannot overshoot together. No fallback
+ * to other migratetypes; the caller's page-by-page refill handles that.
+ */
+static noinline bool exp_run_refill(struct zone *zone, unsigned long want,
+				    int migratetype, unsigned int alloc_flags)
+{
+	struct exp_run *run = this_cpu_ptr(&exp_lc_run);
+	int cap = READ_ONCE(exp_batch);
+	struct page *page = NULL;
+	unsigned long flags;
+	long room;
+	int k;
+
+	if (!cap || !READ_ONCE(sysctl_lc_exp_batch_adaptive) || !exp_task_is_lc() ||
+	    migratetype >= MIGRATE_PCPTYPES ||
+	    (alloc_flags & (ALLOC_TRYLOCK | ALLOC_HIGHATOMIC)))
+		return false;
+	/* A run for another zone or type is still parked on this CPU. */
+	if (run->left)
+		return false;
+	/* Cheap look first, so a refill near the line takes the lock once. */
+	if (exp_run_room(zone, false) < (1L << ilog2(cap)))
+		return false;
+
+	flags = exp_zone_lock(zone);
+	room = exp_run_room(zone, true);
+	for (k = min_t(int, order_base_2(want), pageblock_order);
+	     k >= ilog2(cap) && k > 0; k--) {
+		if ((1L << k) > room)
+			continue;
+		page = __rmqueue_smallest(zone, k, migratetype);
+		if (page)
+			break;
+	}
+	exp_zone_unlock(zone, flags);
+	if (!page)
+		return false;
+	run->zone = zone;
+	run->mt = migratetype;
+	run->page = page;
+	run->left = 1U << k;
+	atomic_long_inc(&exp_run_refills);
+	atomic_long_add(1L << k, &exp_run_refill_pages);
+	return true;
+}
+
 /*
  * Obtain a specified number of elements from the buddy allocator, all under
  * a single hold of the lock, for efficiency.  Add them to the supplied list.
@@ -2751,19 +3018,22 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 {
 	enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
 	unsigned long flags;
-	int i, cap = READ_ONCE(exp_batch);
+	int i, cap = READ_ONCE(exp_batch), chunk = 1;
+	bool lc = false;
 
 	/*
-	 * LEAN: the refill cap follows the same contention rule as the free-side
-	 * release. A streaming allocator's PCP refill grows to base_batch <<
-	 * alloc_factor (2016 pages here); clamping every refill to 64 pages
-	 * costs an LC fault stream ~30x the zone-lock acquisitions and splits
-	 * higher-order blocks into short physical runs. Clamp only when an LC
-	 * task is waiting for this zone's lock (and never an LC's own refill
-	 * in mode 2).
+	 * The refill cap follows the release policy (see lc_exp_batch_adaptive):
+	 * a refill is one chunk when the policy says the lock is wanted, and an
+	 * unclamped refill still ends at the next chunk boundary once it is.
 	 */
-	if (cap && exp_cap_release_due(zone))
-		count = min(count, (unsigned long)max(1, cap >> order));
+	if (cap) {
+		chunk = max(1, cap >> order);
+		lc = exp_task_is_lc();
+		if (READ_ONCE(sysctl_lc_exp_batch_adaptive) != 3 ?
+		    exp_refill_stop(zone, lc) :
+		    (lc && (READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_LC_REFILL_CLAMP)))
+			count = min(count, (unsigned long)chunk);
+	}
 	i = exp_take(zone, order, migratetype, count, list);
 	if (i)
 		return i;
@@ -2777,14 +3047,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
 	for (i = 0; i < count; ++i) {
 		struct page *page;
 
-		/*
-		 * LEAN: an uncontended refill may run to its full size, but once
-		 * an LC task starts waiting for this zone's lock the hold ends at
-		 * the next lc_exp_batch boundary (the caller is happy with fewer
-		 * pages). This is what bounds an LC fault's wait behind a BE
-		 * refill without taxing refills nobody is waiting for.
-		 */
-		if (cap && i && (i % cap) == 0 && exp_cap_release_due(zone))
+		if (cap && i && (i % chunk) == 0 && exp_refill_stop(zone, lc))
 			break;
 
 		page = __rmqueue(zone, order, migratetype, alloc_flags, &rmqm);
@@ -2839,6 +3102,13 @@ int decay_pcp_high(struct zone *zone, struct per_cpu_pages *pcp)
 		todo++;
 	}
 
+	/* An unused run goes back with the periodic decay (local CPU's pcp). */
+	if (unlikely(exp_run_pending(zone, raw_smp_processor_id()))) {
+		spin_lock(&pcp->lock);
+		exp_run_flush(zone, raw_smp_processor_id(), &exp_run_drain_pages);
+		spin_unlock(&pcp->lock);
+	}
+
 	return todo;
 }
 
@@ -2872,6 +3142,7 @@ static void drain_pages_zone(unsigned int cpu, struct zone *zone)
 
 	do {
 		spin_lock(&pcp->lock);
+		exp_run_flush(zone, cpu, &exp_run_drain_pages);
 		count = pcp->count;
 		if (count) {
 			int to_drain = min(count,
@@ -2970,6 +3241,10 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
 				}
 			}
 		}
+
+		/* A parked run counts: it is drained with the lists. */
+		if (!has_pcps && exp_run_pending(zone, cpu))
+			has_pcps = true;
 
 		if (has_pcps)
 			cpumask_set_cpu(cpu, &cpus_with_pcps);
@@ -3604,8 +3879,25 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 
 	do {
 		if (list_empty(list)) {
-			int batch = nr_pcp_alloc(pcp, zone, order);
+			int batch;
 			int alloced;
+
+			/* This CPU's contiguous run, if it has one for us. */
+			if (!order) {
+				page = exp_run_take(zone, migratetype);
+				if (page)
+					continue;
+			}
+
+			batch = nr_pcp_alloc(pcp, zone, order);
+			if (!order &&
+			    unlikely(READ_ONCE(sysctl_lc_exp_batch_flags) &
+				     LC_EXP_BATCH_LC_BLOCK_REFILL) &&
+			    exp_run_refill(zone, batch, migratetype, alloc_flags)) {
+				page = exp_run_take(zone, migratetype);
+				if (page)
+					continue;
+			}
 
 			alloced = rmqueue_bulk(zone, order,
 					batch, list,
@@ -5464,6 +5756,15 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 		return;
 	}
+
+	/*
+	 * Runs parked on other CPUs are free memory no other CPU can use:
+	 * take them back first. If that returned pages, this allocation does
+	 * not need a kill; the next one in the reserve decides again.
+	 */
+	if ((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_RUN_RECLAIM) &&
+	    exp_run_reclaim(page_zone(page)))
+		return;
 
 	spin_lock_irqsave(&lc_oom_state_lock, flags);
 	if (lc_oom_state == LC_OOM_TRIGGERING) {
@@ -7325,6 +7626,7 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 	{ .procname = "lc_exp_mode", .data = &exp_mode, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_mode_max },
 	{ .procname = "lc_exp_batch", .data = &exp_batch, .maxlen = sizeof(int), .mode = 0644, .proc_handler = exp_sysctl, .extra1 = SYSCTL_ZERO, .extra2 = &exp_batch_max },
 	{ .procname = "lc_exp_batch_adaptive", .data = &sysctl_lc_exp_batch_adaptive, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_exp_batch_adaptive_max },
+	{ .procname = "lc_exp_batch_flags", .data = &sysctl_lc_exp_batch_flags, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_exp_batch_flags_max },
 	{ .procname = "lc_victim_fastfree", .data = &sysctl_lc_victim_fastfree, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_fastfree_max },
 	{ .procname = "lc_victim_bail", .data = &sysctl_lc_victim_bail, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_bail_max },
 	{ .procname = "lc_victim_gather_batches", .data = &sysctl_lc_victim_gather_batches, .maxlen = sizeof(int), .mode = 0644, .proc_handler = proc_dointvec_minmax, .extra1 = SYSCTL_ZERO, .extra2 = &lc_victim_gather_batches_max },
