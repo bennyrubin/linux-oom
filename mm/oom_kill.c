@@ -1090,8 +1090,8 @@ static void __oom_kill_process(struct oom_control *oc, struct task_struct *victi
 	count_vm_event(OOM_KILL);
 	/*
 	 * memcg_memory_event_mm() walks the memcg ancestry and calls
-	 * cgroup_file_notify() (kernfs lock + work wake) at every level, inside
-	 * the killer's fault. Optionally hand it to the victim's exit_mmap().
+	 * cgroup_file_notify() (kernfs lock + work wake) at every level, on the
+	 * killer's path. Optionally hand it to the victim's exit_mmap().
 	 */
 	if (READ_ONCE(sysctl_lc_oom_kill_defer) & LC_OOM_KILL_DEFER_MEMCG_EVENT)
 		WRITE_ONCE(mm->oom_kill_event_pending, true);

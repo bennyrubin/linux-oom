@@ -45,6 +45,7 @@
 #include <linux/mm_inline.h>
 #include <linux/mmu_notifier.h>
 #include <linux/migrate.h>
+#include <linux/kthread.h>
 #include <linux/sched/mm.h>
 #include <linux/page_owner.h>
 #include <linux/page_table_check.h>
@@ -5712,8 +5713,9 @@ static bool lc_oom_safe(gfp_t gfp_mask, unsigned int order)
 /*
  * The state machine holds an mm_count reference on the inflight victim's mm
  * so it can test MMF_OOM_SKIP safely. Dropping the last reference runs
- * __mmdrop() (pgd, percpu counters, ...), which does not belong in the LC's
- * page fault: hand it to an unbound worker (kept off isolated CPUs).
+ * __mmdrop() (pgd, percpu counters, ...); an unbound worker (kept off
+ * isolated CPUs) does it, so the kill decision that follows does not wait
+ * for it.
  */
 static LLIST_HEAD(lc_oom_drop_list);
 static void lc_oom_mmdrop_fn(struct work_struct *work)
@@ -5747,24 +5749,8 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	};
 	unsigned long flags;
 
-	oom_alloc_trace_lc("event=lc_reserve_oom_enter pid=%d tgid=%d\n",
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_enter pid=%d tgid=%d\n",
 			   current->pid, current->tgid);
-	if (!lc_oom_safe(gfp_mask, order)) {
-		spin_lock_irqsave(&lc_oom_state_lock, flags);
-		if (lc_oom_state == LC_OOM_IDLE)
-			lc_oom_state = LC_OOM_PENDING;
-		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
-		return;
-	}
-
-	/*
-	 * Runs parked on other CPUs are free memory no other CPU can use:
-	 * take them back first. If that returned pages, this allocation does
-	 * not need a kill; the next one in the reserve decides again.
-	 */
-	if ((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_RUN_RECLAIM) &&
-	    exp_run_reclaim(page_zone(page)))
-		return;
 
 	spin_lock_irqsave(&lc_oom_state_lock, flags);
 	if (lc_oom_state == LC_OOM_TRIGGERING) {
@@ -5789,22 +5775,22 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 		lc_oom_mmdrop_async(old_mm);
 
 	/*
-	 * Never sleep here: the page in hand is already allocated, the kill is
-	 * a side effect. If a BE's own slow path holds oom_lock it is running
-	 * the killer right now; go back to PENDING and let the next in-band
-	 * allocation look again (by then a victim is usually marked and the
-	 * policy reports it as pending, which parks the state machine on it).
+	 * Do not wait for oom_lock: a BE's own slow path that holds it is
+	 * running the killer right now. Go back to PENDING and let the next
+	 * in-band allocation look again (by then a victim is usually marked
+	 * and the policy reports it as pending, which parks the state machine
+	 * on it).
 	 */
 	if (!mutex_trylock(&oom_lock)) {
 		count_vm_event(LC_OOM_COALESCED);
-		oom_alloc_trace_lc("event=lc_reserve_oom_lock_busy pid=%d tgid=%d\n",
+		oom_alloc_trace_if(true, "event=lc_reserve_oom_lock_busy pid=%d tgid=%d\n",
 				   current->pid, current->tgid);
 		spin_lock_irqsave(&lc_oom_state_lock, flags);
 		lc_oom_state = LC_OOM_PENDING;
 		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 		return;
 	}
-	oom_alloc_trace_lc("event=lc_reserve_oom_locked pid=%d tgid=%d\n",
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_locked pid=%d tgid=%d\n",
 			   current->pid, current->tgid);
 	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
 		mutex_unlock(&oom_lock);
@@ -5815,26 +5801,178 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 	}
 
 	count_vm_event(LC_OOM_TRIGGER);
-	oom_alloc_trace_lc("event=lc_reserve_oom_start pid=%d tgid=%d order=%u gfp=%x\n",
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_start pid=%d tgid=%d order=%u gfp=%x\n",
 			   current->pid, current->tgid, order,
 			   (__force unsigned int)gfp_mask);
 	out_of_memory(&oc);
-	oom_alloc_trace_lc("event=lc_reserve_oom_killer_done pid=%d tgid=%d\n",
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_killer_done pid=%d tgid=%d\n",
 			   current->pid, current->tgid);
 	mutex_unlock(&oom_lock);
-	oom_boost_deferred_victim(&oc);
-	oom_alloc_trace_lc("event=lc_reserve_oom_boost_done pid=%d tgid=%d\n",
-			   current->pid, current->tgid);
 
 	spin_lock_irqsave(&lc_oom_state_lock, flags);
 	lc_oom_inflight_mm = oc.inflight_mm;
 	lc_oom_state = oc.inflight_mm ? LC_OOM_WAITING : LC_OOM_PENDING;
 	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
 
-	oom_alloc_trace_lc("event=lc_reserve_oom_done pid=%d tgid=%d inflight=%d\n",
+	/*
+	 * Boost last: a victim on this CPU then outranks this thread, which
+	 * holds no lock and has already published the state.
+	 */
+	oom_boost_deferred_victim(&oc);
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_boost_done pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
+	oom_alloc_trace_if(true, "event=lc_reserve_oom_done pid=%d tgid=%d inflight=%d\n",
 			   current->pid, current->tgid,
 			   !!oc.inflight_mm);
 }
+
+/*
+ * The reserve OOM path is split between the LC's fault and the lc_oom
+ * thread. lc_oom_fault_request() runs in the fault: it makes the safe check
+ * and the run reclaim, records the allocation and wakes the thread, unless
+ * a kill is running or its victim is not torn down yet: the thread would
+ * only coalesce. lc_oom_thread_fn() runs lc_reserve_maybe_oom() on the
+ * recorded allocation.
+ *
+ * The record is under lc_oom_state_lock. Its nodemask is copied by value,
+ * as ac->nodemask may be the LC's cpuset mems or a mempolicy's nodes, which
+ * the thread must not dereference. out_of_memory() runs with the thread as
+ * current: it honours the copied mask (constrained_alloc(),
+ * mempolicy_in_oom_domain()) but not what it reads from current, such as
+ * the LC's cpuset (cpuset_zone_allowed(), cpuset_mems_allowed_intersects()),
+ * task_will_free_mem() and oom_kill_allocating_task.
+ *
+ * The record keeps the LC's page only to find its zone (page_zone()). The
+ * page may be freed before the thread reads it; its struct page stays valid
+ * unless its memory block is hot-removed (CONFIG_MEMORY_HOTREMOVE).
+ */
+static struct task_struct *lc_oom_thread;
+static bool lc_oom_thread_kick;
+static struct page *lc_oom_req_page;
+static gfp_t lc_oom_req_gfp;
+static unsigned int lc_oom_req_order;
+static struct alloc_context lc_oom_req_ac;
+static nodemask_t lc_oom_req_nodemask;
+
+static void lc_oom_fault_request(struct page *page, gfp_t gfp_mask,
+				 unsigned int order,
+				 const struct alloc_context *ac)
+{
+	struct task_struct *task = READ_ONCE(lc_oom_thread);
+	unsigned long flags;
+	bool busy;
+
+	if (!lc_oom_safe(gfp_mask, order) || !task) {
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		if (lc_oom_state == LC_OOM_IDLE)
+			lc_oom_state = LC_OOM_PENDING;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		return;
+	}
+
+	/*
+	 * Runs parked on other CPUs are free memory no other CPU can use:
+	 * take them back first. If that returned pages, this allocation does
+	 * not need a kill; the next one in the reserve decides again.
+	 */
+	if ((READ_ONCE(sysctl_lc_exp_batch_flags) & LC_EXP_BATCH_RUN_RECLAIM) &&
+	    exp_run_reclaim(page_zone(page)))
+		return;
+
+	spin_lock_irqsave(&lc_oom_state_lock, flags);
+	busy = lc_oom_state == LC_OOM_TRIGGERING ||
+	       (lc_oom_state == LC_OOM_WAITING &&
+		!test_bit(MMF_OOM_SKIP, &lc_oom_inflight_mm->flags));
+	if (!busy) {
+		lc_oom_req_page = page;
+		lc_oom_req_gfp = gfp_mask;
+		lc_oom_req_order = order;
+		lc_oom_req_ac = *ac;
+		if (ac->nodemask) {
+			lc_oom_req_nodemask = *ac->nodemask;
+			lc_oom_req_ac.nodemask = &lc_oom_req_nodemask;
+		}
+	}
+	spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+	if (busy) {
+		count_vm_event(LC_OOM_COALESCED);
+		return;
+	}
+	oom_alloc_trace_lc("event=lc_reserve_oom_wake pid=%d tgid=%d\n",
+			   current->pid, current->tgid);
+	/*
+	 * A request that gets here ends in one LC_OOM_TRIGGER or
+	 * LC_OOM_COALESCED (or in no kill once the reserve is clear): the
+	 * request that sets the kick is counted by the thread's next pass, one
+	 * that finds it set is coalesced here. This holds because one thread makes one pass per
+	 * kick; with several threads, count the fault's requests and the
+	 * threads' outcomes in separate counters instead.
+	 */
+	if (!xchg(&lc_oom_thread_kick, true))
+		wake_up_process(task);
+	else
+		count_vm_event(LC_OOM_COALESCED);
+}
+
+static int lc_oom_thread_fn(void *unused)
+{
+	struct alloc_context ac;
+	nodemask_t nodemask;
+	unsigned int order;
+	unsigned long flags;
+	struct page *page;
+	gfp_t gfp;
+
+	/*
+	 * PF_MEMALLOC, as kswapd sets it: this thread's allocations fall back
+	 * to ALLOC_NO_WATERMARKS (__gfp_pfmemalloc_flags()), so the LC reserve
+	 * does not hold them back, and they never enter direct reclaim or
+	 * __alloc_pages_may_oom(), which would retry forever on the oom_lock
+	 * this thread holds.
+	 */
+	current->flags |= PF_MEMALLOC;
+	for (;;) {
+		set_current_state(TASK_IDLE);
+		/* Pairs with the xchg before the wake: no kick is missed. */
+		if (!xchg(&lc_oom_thread_kick, false)) {
+			schedule();
+			continue;
+		}
+		__set_current_state(TASK_RUNNING);
+		spin_lock_irqsave(&lc_oom_state_lock, flags);
+		page = lc_oom_req_page;
+		gfp = lc_oom_req_gfp;
+		order = lc_oom_req_order;
+		ac = lc_oom_req_ac;
+		nodemask = lc_oom_req_nodemask;
+		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
+		/* The next request may rewrite lc_oom_req_nodemask. */
+		if (ac.nodemask)
+			ac.nodemask = &nodemask;
+		lc_reserve_maybe_oom(page, gfp, order, &ac);
+	}
+	return 0;
+}
+
+static int __init lc_oom_thread_init(void)
+{
+	struct task_struct *task;
+
+	task = kthread_run(lc_oom_thread_fn, NULL, "lc_oom");
+	if (IS_ERR(task)) {
+		pr_err("Failed to start lc_oom thread: LC reserve OOM kills disabled\n");
+		return PTR_ERR(task);
+	}
+	/*
+	 * SCHED_FIFO and unbound: woken on an LC's CPU it preempts that LC for
+	 * the whole decision. Keep it off the LC CPUs from user space with an
+	 * affinity mask of the other CPUs.
+	 */
+	sched_set_fifo(task);
+	WRITE_ONCE(lc_oom_thread, task);
+	return 0;
+}
+late_initcall(lc_oom_thread_init);
 
 static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		int preferred_nid, nodemask_t *nodemask,
@@ -6157,7 +6295,7 @@ out:
 				count_vm_event(LC_RESERVE_HIT);
 				if (order)
 					count_vm_event(LC_HIGHORDER_HIT);
-				lc_reserve_maybe_oom(page, gfp, order, &ac);
+				lc_oom_fault_request(page, gfp, order, &ac);
 			}
 		}
 	}

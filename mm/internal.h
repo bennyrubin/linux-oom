@@ -66,7 +66,8 @@ static inline bool oom_alloc_trace_current_lc(void)
 extern int sysctl_lc_victim_fastfree;
 extern int sysctl_lc_victim_gather_batches;
 /*
- * Work moved off the killer's (the LC's) fault onto the victim's own exit:
+ * Work moved off the killer's path (lc_oom, or a BE's own slow path) onto
+ * the victim's own exit:
  *  bit 0: skip the inline RT boost of the victim (exit_mmap boosts itself);
  *  bit 1: raise the memcg MEMCG_OOM_KILL event from the victim's exit_mmap.
  */
