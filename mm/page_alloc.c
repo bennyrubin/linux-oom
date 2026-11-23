@@ -5775,30 +5775,20 @@ static void lc_reserve_maybe_oom(struct page *page, gfp_t gfp_mask,
 		lc_oom_mmdrop_async(old_mm);
 
 	/*
-	 * Do not wait for oom_lock: a BE's own slow path that holds it is
-	 * running the killer right now. Go back to PENDING and let the next
-	 * in-band allocation look again (by then a victim is usually marked
-	 * and the policy reports it as pending, which parks the state machine
-	 * on it).
+	 * The fault woke this thread only after its run reclaim found nothing
+	 * to take back, so the request is committed: wait for oom_lock rather
+	 * than give it up, and do not re-check the reserve here. Run from
+	 * this thread, a re-check sees the zone some microseconds after the
+	 * LC's allocation, when kswapd or a parked run may have lifted it
+	 * above the reserve for a moment; giving up then left the reserve
+	 * draining until the next in-band wake, too late for the victim's
+	 * first pages. If a BE's slow path holding oom_lock has marked a
+	 * victim meanwhile, out_of_memory() finds it and parks the state
+	 * machine on it (oom_evaluate_task() aborts on a live OOM victim).
 	 */
-	if (!mutex_trylock(&oom_lock)) {
-		count_vm_event(LC_OOM_COALESCED);
-		oom_alloc_trace_if(true, "event=lc_reserve_oom_lock_busy pid=%d tgid=%d\n",
-				   current->pid, current->tgid);
-		spin_lock_irqsave(&lc_oom_state_lock, flags);
-		lc_oom_state = LC_OOM_PENDING;
-		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
-		return;
-	}
+	mutex_lock(&oom_lock);
 	oom_alloc_trace_if(true, "event=lc_reserve_oom_locked pid=%d tgid=%d\n",
 			   current->pid, current->tgid);
-	if (!lc_allocation_in_reserve(page, gfp_mask, order, ac)) {
-		mutex_unlock(&oom_lock);
-		spin_lock_irqsave(&lc_oom_state_lock, flags);
-		lc_oom_state = LC_OOM_IDLE;
-		spin_unlock_irqrestore(&lc_oom_state_lock, flags);
-		return;
-	}
 
 	count_vm_event(LC_OOM_TRIGGER);
 	oom_alloc_trace_if(true, "event=lc_reserve_oom_start pid=%d tgid=%d order=%u gfp=%x\n",
@@ -5902,7 +5892,7 @@ static void lc_oom_fault_request(struct page *page, gfp_t gfp_mask,
 			   current->pid, current->tgid);
 	/*
 	 * A request that gets here ends in one LC_OOM_TRIGGER or
-	 * LC_OOM_COALESCED (or in no kill once the reserve is clear): the
+	 * LC_OOM_COALESCED (a kill already in flight): the
 	 * request that sets the kick is counted by the thread's next pass, one
 	 * that finds it set is coalesced here. This holds because one thread makes one pass per
 	 * kick; with several threads, count the fault's requests and the
